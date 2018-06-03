@@ -1,0 +1,5335 @@
+diff -rupN qmail-1.03/byte_cspn.c qmail-1.03-IPv6spfptr/byte_cspn.c
+--- qmail-1.03/byte_cspn.c  1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/byte_cspn.c   2014-10-15 11:59:36.886618519 +0300
+@@ -0,0 +1,11 @@
++#include "byte.h"
++
++unsigned int byte_cspn(s,n,c)
++register char *s;
++register unsigned int n;
++register char *c;
++{
++  while(*c)
++    n = byte_chr(s,n,*c++);
++  return n;
++}
+diff -rupN qmail-1.03/byte.h qmail-1.03-IPv6spfptr/byte.h
+--- qmail-1.03/byte.h   1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/byte.h    2014-10-15 11:59:36.886618519 +0300
+@@ -3,6 +3,8 @@
+  
+ extern unsigned int byte_chr();
+ extern unsigned int byte_rchr();
++extern unsigned int byte_cspn();
++extern unsigned int byte_rcspn();
+ extern void byte_copy();
+ extern void byte_copyr();
+ extern int byte_diff();
+diff -rupN qmail-1.03/byte_rcspn.c qmail-1.03-IPv6spfptr/byte_rcspn.c
+--- qmail-1.03/byte_rcspn.c 1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/byte_rcspn.c  2014-10-15 11:59:36.886618519 +0300
+@@ -0,0 +1,17 @@
++#include "byte.h"
++
++unsigned int byte_rcspn(s,n,c)
++register char *s;
++register unsigned int n;
++register char *c;
++{
++  unsigned int ret,pos,i;
++
++  for(ret = n,pos = 0;*c;++c) {
++    i = byte_rchr(s + pos,n - pos,*c) + pos;
++    if (i < n) ret = pos = i;
++  }
++
++  return ret;
++}
++
+diff -rupN qmail-1.03/conf-cc qmail-1.03-IPv6spfptr/conf-cc
+--- qmail-1.03/conf-cc  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/conf-cc   2014-10-15 11:59:44.618618335 +0300
+@@ -1,3 +1,5 @@
++cc -O2 -DINET6
+ cc -O2
++cc -O2 -DINET6 -DTCPTO_REFUSED
+  
+ This will be used to compile .c files.
+diff -rupN qmail-1.03/dns.c qmail-1.03-IPv6spfptr/dns.c
+--- qmail-1.03/dns.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/dns.c 2014-10-15 12:04:40.542611282 +0300
+@@ -3,14 +3,14 @@
+ #include <sys/types.h>
+ #include <netinet/in.h>
+ #include <arpa/nameser.h>
++#include <sys/socket.h>
+ #include <resolv.h>
+ #include <errno.h>
+ extern int res_query();
+ extern int res_search();
+-extern int errno;
+-extern int h_errno;
+ #include "ip.h"
+ #include "ipalloc.h"
++#include "strsalloc.h"
+ #include "fmt.h"
+ #include "alloc.h"
+ #include "str.h"
+@@ -21,14 +21,21 @@ extern int h_errno;
+ static unsigned short getshort(c) unsigned char *c;
+ { unsigned short u; u = c[0]; return (u << 8) + c[1]; }
+  
+-static union { HEADER hdr; unsigned char buf[PACKETSZ]; } response;
++static struct { unsigned char *buf; } response;
++static int responsebuflen = 0;
+ static int responselen;
+ static unsigned char *responseend;
+ static unsigned char *responsepos;
++static u_long saveresoptions;
+  
+ static int numanswers;
+ static char name[MAXDNAME];
+ static struct ip_address ip;
++#ifdef INET6
++static struct ip6_address ip6;
++#endif
++
++static stralloc txt = {0};
+ unsigned short pref;
+  
+ static stralloc glue = {0};
+@@ -45,18 +52,34 @@ int type;
+  errno = 0;
+  if (!stralloc_copy(&glue,domain)) return DNS_MEM;
+  if (!stralloc_0(&glue)) return DNS_MEM;
+- responselen = lookup(glue.s,C_IN,type,response.buf,sizeof(response));
++ if (!responsebuflen)
++  if (response.buf = (unsigned char *)alloc(PACKETSZ+1))
++   responsebuflen = PACKETSZ+1;
++  else return DNS_MEM;
++
++ responselen = lookup(glue.s,C_IN,type,response.buf,responsebuflen);
++ 
++ if ((responselen >= responsebuflen) ||
++     (responselen > 0 && (((HEADER *)response.buf)->tc)))
++  {
++   if (responsebuflen < 65536)
++    if (alloc_re(&response.buf, responsebuflen, 65536))
++     responsebuflen = 65536;
++    else return DNS_MEM;
++    saveresoptions = _res.options;
++    _res.options |= RES_USEVC;
++    responselen = lookup(glue.s,C_IN,type,response.buf,responsebuflen);
++    _res.options = saveresoptions;
++  }
+  if (responselen <= 0)
+   {
+    if (errno == ECONNREFUSED) return DNS_SOFT;
+    if (h_errno == TRY_AGAIN) return DNS_SOFT;
+    return DNS_HARD;
+   }
+- if (responselen >= sizeof(response))
+-   responselen = sizeof(response);
+  responseend = response.buf + responselen;
+  responsepos = response.buf + sizeof(HEADER);
+- n = ntohs(response.hdr.qdcount);
++ n = ntohs(((HEADER *)response.buf)->qdcount);
+  while (n-- > 0)
+   {
+    i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
+@@ -66,7 +89,8 @@ int type;
+    if (i < QFIXEDSZ) return DNS_SOFT;
+    responsepos += QFIXEDSZ;
+   }
+- numanswers = ntohs(response.hdr.ancount);
++ numanswers = ntohs(((HEADER *)response.buf)->ancount);
++
+  return 0;
+ }
+  
+@@ -142,6 +166,45 @@ int wanttype;
+  return 0;
+ }
+  
++
++#ifdef INET6
++static int findip6(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   if (rrdlen < 16)
++     return DNS_SOFT;
++   bcopy(&responsepos[0], &ip6.d, 16);
++   responsepos += rrdlen;
++   return 1;
++  }
++
++ responsepos += rrdlen;
++ return 0;
++}
++#endif
++
++
+ static int findmx(wanttype)
+ int wanttype;
+ {
+@@ -179,6 +242,49 @@ int wanttype;
+  return 0;
+ }
+  
++static int findtxt(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++   
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   unsigned short txtpos;
++   unsigned char txtlen;
++
++   txt.len = 0;
++   for (txtpos = 0;txtpos < rrdlen;txtpos += txtlen)
++    {
++     txtlen = responsepos[txtpos++];
++     if (txtlen > rrdlen-txtpos) txtlen = rrdlen-txtpos;
++     if (!stralloc_catb(&txt,&responsepos[txtpos],txtlen)) return DNS_MEM;
++    }
++
++   responsepos += rrdlen;
++   return 1;
++ }
++
++ responsepos += rrdlen;
++ return 0;
++}
++
+ void dns_init(flagsearch)
+ int flagsearch;
+ {
+@@ -189,6 +295,9 @@ int flagsearch;
+ int dns_cname(sa)
+ stralloc *sa;
+ {
++
++return 0;
++
+  int r;
+  int loop;
+  for (loop = 0;loop < 10;++loop)
+@@ -196,7 +305,7 @@ stralloc *sa;
+    if (!sa->len) return loop;
+    if (sa->s[sa->len - 1] == ']') return loop;
+    if (sa->s[sa->len - 1] == '.') { --sa->len; continue; }
+-   switch(resolve(sa,T_ANY))
++   switch(resolve(sa,T_CNAME))
+     {
+      case DNS_MEM: return DNS_MEM;
+      case DNS_SOFT: return DNS_SOFT;
+@@ -237,15 +346,18 @@ struct ip_address *ip;
+  return len;
+ }
+  
+-int dns_ptr(sa,ip)
+-stralloc *sa;
++static int dns_ptrplus(ssa,ip)
++strsalloc *ssa;
+ struct ip_address *ip;
+ {
++ stralloc sa = {0};
+  int r;
+  
+- if (!stralloc_ready(sa,iaafmt((char *) 0,ip))) return DNS_MEM;
+- sa->len = iaafmt(sa->s,ip);
+- switch(resolve(sa,T_PTR))
++ if (!stralloc_ready(&sa,iaafmt((char *) 0,ip))) return DNS_MEM;
++ sa.len = iaafmt(sa.s,ip);
++ r = resolve(&sa,T_PTR);
++ alloc_free(sa.s);
++ switch(r)
+   {
+    case DNS_MEM: return DNS_MEM;
+    case DNS_SOFT: return DNS_SOFT;
+@@ -256,12 +368,89 @@ struct ip_address *ip;
+    if (r == DNS_SOFT) return DNS_SOFT;
+    if (r == 1)
+     {
+-     if (!stralloc_copys(sa,name)) return DNS_MEM;
++     stralloc sa2 = {0};
++     if (!stralloc_copys(&sa2,name)) return DNS_MEM;
++     if (!strsalloc_append(ssa,&sa2)) return DNS_MEM;
++    }
++  }
++ if (ssa->len) return 0;
++ return DNS_HARD;
++}
++
++
++#ifdef INET6
++static int iaafmt6(s,ip)
++char *s;
++struct ip6_address *ip;
++{
++ unsigned int i;
++ int j;
++ unsigned int len;
++ static char data[] = "0123456789abcdef";
++ len = 0;
++
++ if (s) {
++   for (j = 15; j >= 0; j--) {
++     *s++ = data[ip->d[j] & 0x0f];
++     *s++ = '.';
++     *s++ = data[(ip->d[j] >> 4) & 0x0f];
++     *s++ = '.';
++   }
++   strcpy(s, "ip6.arpa");
++ }
++ return 72;
++ /* 1.2.3.4.5.6.7.8.9.a.b.c.d.e.f.1.2.3.4.5.6.7.8.9.a.b.c.d.e.f.ip6.arpa */
++}
++#endif
++
++int dns_ptr(ssa,ip)
++strsalloc *ssa;
++struct ip_address *ip;
++{
++ int r;
++ int j;
++
++ if (!strsalloc_readyplus(ssa,0)) return DNS_MEM;
++ ssa->len = 0;
++ r = dns_ptrplus(ssa,ip);
++ if (r < 0)
++  {
++      for (j = 0;j < ssa->len;++j) {
++           alloc_free(ssa->sa[j].s);
++       }
++      ssa->len = 0;
++  }
++  
++ return r;
++}
++
+  
+ static int dns_ipplus(ia,sa,pref)
+ ipalloc *ia;
+@@ -269,36 +458,72 @@ stralloc *sa;
+ int pref;
+ {
+  int r;
+- struct ip_mx ix;
++ struct ip_mx ix = {0};
++ int err4 = 0, err6 = 0;
+  
+  if (!stralloc_copy(&glue,sa)) return DNS_MEM;
+  if (!stralloc_0(&glue)) return DNS_MEM;
++ 
+  if (glue.s[0]) {
+-   ix.pref = 0;
+-   if (!glue.s[ip_scan(glue.s,&ix.ip)] || !glue.s[ip_scanbracket(glue.s,&ix.ip)])
++    ix.af = AF_INET;
++    if (!glue.s[ip_scan(glue.s,&ix.addr.ip)] || !glue.s[ip_scanbracket(glue.s,&ix.addr.ip)])
+     {
+      if (!ipalloc_append(ia,&ix)) return DNS_MEM;
+      return 0;
+     }
+  }
+  
+- switch(resolve(sa,T_A))
++#ifdef INET6
++ switch(resolve(sa,T_AAAA))
+   {
+-   case DNS_MEM: return DNS_MEM;
+-   case DNS_SOFT: return DNS_SOFT;
+-   case DNS_HARD: return DNS_HARD;
++   case DNS_MEM: err6 = DNS_MEM; break;
++   case DNS_SOFT: err6 = DNS_SOFT; break;
++   case DNS_HARD: err6 = DNS_HARD; break;
++   default:
++     while ((r = findip6(T_AAAA)) != 2)
++       {
++         ix.af = AF_INET6;
++         ix.addr.ip6 = ip6;
++         ix.pref = pref;
++         if (r == DNS_SOFT) { err6 = DNS_SOFT; break; }
++         if (r == 1)
++           if (!ipalloc_append(ia,&ix)) { err6 = DNS_MEM; break; }
++       }
++     break;
+   }
++#endif
++
++ switch(resolve(sa,T_A))
++  {
++   case DNS_MEM: err4 = DNS_MEM; break;
++   case DNS_SOFT: err4 = DNS_SOFT; break;
++   case DNS_HARD: err4 = DNS_HARD; break;
++   default:
+  while ((r = findip(T_A)) != 2)
+   {
+-   ix.ip = ip;
++   ix.af = AF_INET;
++   ix.addr.ip = ip;
+    ix.pref = pref;
+-   if (r == DNS_SOFT) return DNS_SOFT;
+-   if (r == 1)
+-     if (!ipalloc_append(ia,&ix)) return DNS_MEM;
++    if (r == DNS_SOFT) { err4 = DNS_SOFT; break; }
++   if (r == 1) 
++   if (!ipalloc_append(ia,&ix)) { err4 = DNS_MEM; break; }
++    }
++     break;
++  }
++
++#ifdef INET6
++ if (err4 != 0 && err6 != 0) {
++   return err4;
+   }
+  return 0;
++#else
++ return err4;
++#endif
++
+ }
+  
++
++
+ int dns_ip(ia,sa)
+ ipalloc *ia;
+ stralloc *sa;
+@@ -327,9 +552,9 @@ unsigned long random;
+  if (!stralloc_copy(&glue,sa)) return DNS_MEM;
+  if (!stralloc_0(&glue)) return DNS_MEM;
+  if (glue.s[0]) {
+-   ix.pref = 0;
+-   if (!glue.s[ip_scan(glue.s,&ix.ip)] || !glue.s[ip_scanbracket(glue.s,&ix.ip)])
++    if (!glue.s[ip_scan(glue.s,&ix.addr.ip)] || !glue.s[ip_scanbracket(glue.s,&ix.addr.ip)])
+     {
++     ix.af = AF_INET;
+      if (!ipalloc_append(ia,&ix)) return DNS_MEM;
+      return 0;
+     }
+@@ -398,3 +623,50 @@ unsigned long random;
+  alloc_free(mx);
+  return flagsoft;
+ }
++
++
++static int dns_txtplus(ssa,sa)
++strsalloc *ssa;
++stralloc *sa;
++{
++ int r;
++
++ switch(resolve(sa,T_TXT)) 
++  {
++   case DNS_MEM: return DNS_MEM;
++   case DNS_SOFT: return DNS_SOFT;
++   case DNS_HARD: return DNS_HARD;
++  }
++ while ((r = findtxt(T_TXT)) != 2)
++  {
++   if (r == DNS_SOFT) return DNS_SOFT;
++   if (r == 1)
++    {
++     stralloc sa = {0};
++     if (!stralloc_copy(&sa,&txt)) return DNS_MEM;
++     if (!strsalloc_append(ssa,&sa)) return DNS_MEM;
++    }
++  }
++ if (ssa->len) return 0;
++ return DNS_HARD;
++}
++
++int dns_txt(ssa,sa)
++strsalloc *ssa;
++stralloc *sa;
++{
++ int r;
++ int j;
++
++ if (!strsalloc_readyplus(ssa,0)) return DNS_MEM;
++ ssa->len = 0;
++ r = dns_txtplus(ssa,sa);
++ if (r < 0)
++  {
++   for (j = 0;j < ssa->len;++j)
++    alloc_free(ssa->sa[j].s);
++   ssa->len = 0;
++  }
++ return r;
++}
++
+diff -rupN qmail-1.03/dns.c~ qmail-1.03-IPv6spfptr/dns.c~
+--- qmail-1.03/dns.c~   1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/dns.c~    2014-10-15 11:59:44.622618335 +0300
+@@ -0,0 +1,639 @@
++#include <stdio.h>
++#include <netdb.h>
++#include <sys/types.h>
++#include <netinet/in.h>
++#include <arpa/nameser.h>
++#include <sys/socket.h>
++#include <resolv.h>
++#include <errno.h>
++extern int res_query();
++extern int res_search();
++extern int errno;
++extern int h_errno;
++#include "ip.h"
++#include "ipalloc.h"
++#include "strsalloc.h"
++#include "fmt.h"
++#include "alloc.h"
++#include "str.h"
++#include "stralloc.h"
++#include "dns.h"
++#include "case.h"
++
++static unsigned short getshort(c) unsigned char *c;
++{ unsigned short u; u = c[0]; return (u << 8) + c[1]; }
++
++static union { HEADER hdr; unsigned char buf[PACKETSZ]; } response;
++static int responselen;
++static unsigned char *responseend;
++static unsigned char *responsepos;
++
++static int numanswers;
++static char name[MAXDNAME];
++static struct ip_address ip;
++static stralloc txt = {0};
++unsigned short pref;
++
++static stralloc glue = {0};
++
++static int (*lookup)() = res_query;
++
++static int resolve(domain,type)
++stralloc *domain;
++int type;
++{
++ int n;
++ int i;
++
++ errno = 0;
++ if (!stralloc_copy(&glue,domain)) return DNS_MEM;
++ if (!stralloc_0(&glue)) return DNS_MEM;
++ responselen = lookup(glue.s,C_IN,type,response.buf,sizeof(response));
++ if (responselen <= 0)
++  {
++   if (errno == ECONNREFUSED) return DNS_SOFT;
++   if (h_errno == TRY_AGAIN) return DNS_SOFT;
++   return DNS_HARD;
++  }
++ if (responselen >= sizeof(response))
++   responselen = sizeof(response);
++ responseend = response.buf + responselen;
++ responsepos = response.buf + sizeof(HEADER);
++ n = ntohs(response.hdr.qdcount);
++ while (n-- > 0)
++  {
++   i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++   if (i < 0) return DNS_SOFT;
++   responsepos += i;
++   i = responseend - responsepos;
++   if (i < QFIXEDSZ) return DNS_SOFT;
++   responsepos += QFIXEDSZ;
++  }
++ numanswers = ntohs(response.hdr.ancount);
++ return 0;
++}
++
++static int findname(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++   
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   if (dn_expand(response.buf,responseend,responsepos,name,MAXDNAME) < 0)
++     return DNS_SOFT;
++   responsepos += rrdlen;
++   return 1;
++  }
++   
++ responsepos += rrdlen;
++ return 0;
++}
++
++static int findip(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++   
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   if (rrdlen < 4)
++     return DNS_SOFT;
++   ip.d[0] = responsepos[0];
++   ip.d[1] = responsepos[1];
++   ip.d[2] = responsepos[2];
++   ip.d[3] = responsepos[3];
++   responsepos += rrdlen;
++   return 1;
++  }
++   
++ responsepos += rrdlen;
++ return 0;
++}
++
++#ifdef INET6
++static int findip6(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++   
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   if (rrdlen < 16)
++     return DNS_SOFT;
++   bcopy(&responsepos[0], &ip6.d, 16);
++   responsepos += rrdlen;
++   return 1;
++  }
++   
++ responsepos += rrdlen;
++ return 0;
++}
++#endif
++
++static int findmx(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++   
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   if (rrdlen < 3)
++     return DNS_SOFT;
++   pref = (responsepos[0] << 8) + responsepos[1];
++   if (dn_expand(response.buf,responseend,responsepos + 2,name,MAXDNAME) < 0)
++     return DNS_SOFT;
++   responsepos += rrdlen;
++   return 1;
++  }
++   
++ responsepos += rrdlen;
++ return 0;
++}
++
++static int findtxt(wanttype)
++int wanttype;
++{
++ unsigned short rrtype;
++ unsigned short rrdlen;
++ int i;
++
++ if (numanswers <= 0) return 2;
++ --numanswers;
++ if (responsepos == responseend) return DNS_SOFT;
++
++ i = dn_expand(response.buf,responseend,responsepos,name,MAXDNAME);
++ if (i < 0) return DNS_SOFT;
++ responsepos += i;
++
++ i = responseend - responsepos;
++ if (i < 4 + 3 * 2) return DNS_SOFT;
++   
++ rrtype = getshort(responsepos);
++ rrdlen = getshort(responsepos + 8);
++ responsepos += 10;
++
++ if (rrtype == wanttype)
++  {
++   unsigned short txtpos;
++   unsigned char txtlen;
++
++   txt.len = 0;
++   for (txtpos = 0;txtpos < rrdlen;txtpos += txtlen)
++    {
++     txtlen = responsepos[txtpos++];
++     if (txtlen > rrdlen-txtpos) txtlen = rrdlen-txtpos;
++     if (!stralloc_catb(&txt,&responsepos[txtpos],txtlen)) return DNS_MEM;
++    }
++
++   responsepos += rrdlen;
++   return 1;
++ }
++
++ responsepos += rrdlen;
++ return 0;
++}
++
++void dns_init(flagsearch)
++int flagsearch;
++{
++ res_init();
++ if (flagsearch) lookup = res_search;
++}
++
++int dns_cname(sa)
++stralloc *sa;
++{
++ int r;
++ int loop;
++ for (loop = 0;loop < 10;++loop)
++  {
++   if (!sa->len) return loop;
++   if (sa->s[sa->len - 1] == ']') return loop;
++   if (sa->s[sa->len - 1] == '.') { --sa->len; continue; }
++   switch(resolve(sa,T_ANY))
++    {
++     case DNS_MEM: return DNS_MEM;
++     case DNS_SOFT: return DNS_SOFT;
++     case DNS_HARD: return loop;
++     default:
++       while ((r = findname(T_CNAME)) != 2)
++   {
++    if (r == DNS_SOFT) return DNS_SOFT;
++    if (r == 1)
++     {
++      if (!stralloc_copys(sa,name)) return DNS_MEM;
++      break;
++     }
++   }
++       if (r == 2) return loop;
++    }
++  }
++ return DNS_HARD; /* alias loop */
++}
++
++#define FMT_IAA 40
++
++static int iaafmt(s,ip)
++char *s;
++struct ip_address *ip;
++{
++ unsigned int i;
++ unsigned int len;
++ len = 0;
++ i = fmt_ulong(s,(unsigned long) ip->d[3]); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,(unsigned long) ip->d[2]); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,(unsigned long) ip->d[1]); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,(unsigned long) ip->d[0]); len += i; if (s) s += i;
++ i = fmt_str(s,".in-addr.arpa."); len += i; if (s) s += i;
++ return len;
++}
++
++static int dns_ptrplus(ssa,ip)
++strsalloc *ssa;
++struct ip_address *ip;
++{
++ stralloc sa = {0};
++ int r;
++
++ if (!stralloc_ready(&sa,iaafmt((char *) 0,ip))) return DNS_MEM;
++ sa.len = iaafmt(sa.s,ip);
++ r = resolve(&sa,T_PTR);
++ alloc_free(sa.s);
++ switch(r)
++  {
++   case DNS_MEM: return DNS_MEM;
++   case DNS_SOFT: return DNS_SOFT;
++   case DNS_HARD: return DNS_HARD;
++  }
++ while ((r = findname(T_PTR)) != 2)
++  {
++   if (r == DNS_SOFT) return DNS_SOFT;
++   if (r == 1)
++    {
++     stralloc sa2 = {0};
++     if (!stralloc_copys(&sa2,name)) return DNS_MEM;
++     if (!strsalloc_append(ssa,&sa2)) return DNS_MEM;
++    }
++  }
++ if (ssa->len) return 0;
++ return DNS_HARD;
++}
++
++int dns_ptr(ssa,ip)
++strsalloc *ssa;
++struct ip_address *ip;
++{
++ int r;
++ int j;
++
++ if (!strsalloc_readyplus(ssa,0)) return DNS_MEM;
++ ssa->len = 0;
++ r = dns_ptrplus(ssa,ip);
++ if (r < 0)
++  {
++   for (j = 0;j < ssa->len;++j)
++    alloc_free(ssa->sa[j].s);
++   ssa->len = 0;
++  }
++ return r;
++}
++
++
++#ifdef INET6
++
++int dns_ptr6(sa,ip)
++stralloc *sa;
++struct ip6_address *ip;
++{
++ int r;
++
++ if (!stralloc_ready(sa,iaafmt6((char *) 0,ip))) return DNS_MEM;
++ sa->len = iaafmt6(sa->s,ip);
++ switch(resolve(sa,T_PTR)) 
++  {
++   case DNS_MEM: return DNS_MEM;
++   case DNS_SOFT: return DNS_SOFT;
++   case DNS_HARD: return DNS_HARD;
++  }
++ while ((r = findname(T_PTR)) != 2)
++  {
++   if (r == DNS_SOFT) return DNS_SOFT;
++   if (r == 1)
++    {
++     if (!stralloc_copys(sa,name)) return DNS_MEM;
++     return 0;
++    }
++  }
++ return DNS_HARD;
++}
++#endif
++
++static int dns_ipplus(ia,sa,pref)
++ipalloc *ia;
++stralloc *sa;
++int pref;
++{
++ int r;
++ struct ip_mx ix;
++ int err4 = 0, err6 = 0;
++
++ if (!stralloc_copy(&glue,sa)) return DNS_MEM;
++ if (!stralloc_0(&glue)) return DNS_MEM;
++ if (glue.s[0]) {
++   ix.pref = 0;
++   ix.af = AF_INET;
++   if (!glue.s[ip_scan(glue.s,&ix.addr.ip)] || !glue.s[ip_scanbracket(glue.s,&ix.addr.ip)])
++    {
++     if (!ipalloc_append(ia,&ix)) return DNS_MEM;
++     return 0;
++    }
++ }
++
++#ifdef INET6
++ switch(resolve(sa,T_AAAA))
++  {
++   case DNS_MEM: err6 = DNS_MEM; break;
++   case DNS_SOFT: err6 = DNS_SOFT; break;
++   case DNS_HARD: err6 = DNS_HARD; break;
++   default:
++     while ((r = findip6(T_AAAA)) != 2)
++       {
++         ix.af = AF_INET6;
++         ix.addr.ip6 = ip6;
++         ix.pref = pref;
++    if (r == DNS_SOFT) { err6 = DNS_SOFT; break; }
++    if (r == 1)
++      if (!ipalloc_append(ia,&ix)) { err6 = DNS_MEM; break; }
++       }
++     break;
++  }
++#endif
++
++ switch(resolve(sa,T_A))
++  {
++   case DNS_MEM: err4 = DNS_MEM; break;
++   case DNS_SOFT: err4 = DNS_SOFT; break;
++   case DNS_HARD: err4 = DNS_HARD; break;
++   default:
++ while ((r = findip(T_A)) != 2)
++  {
++         ix.af = AF_INET;
++         ix.addr.ip = ip;
++   ix.pref = pref;
++    if (r == DNS_SOFT) { err4 = DNS_SOFT; break; }
++   if (r == 1)
++      if (!ipalloc_append(ia,&ix)) { err4 = DNS_MEM; break; }
++       }
++     break;
++  }
++
++#ifdef INET6
++ if (err4 != 0 && err6 != 0) {
++   return err4;
++  }
++ return 0;
++#else
++ return err4;
++#endif
++}
++
++int dns_ip(ia,sa)
++ipalloc *ia;
++stralloc *sa;
++{
++ if (!ipalloc_readyplus(ia,0)) return DNS_MEM;
++ ia->len = 0;
++ return dns_ipplus(ia,sa,0);
++}
++
++int dns_mxip(ia,sa,random)
++ipalloc *ia;
++stralloc *sa;
++unsigned long random;
++{
++ int r;
++ struct mx { stralloc sa; unsigned short p; } *mx;
++ struct ip_mx ix;
++ int nummx;
++ int i;
++ int j;
++ int flagsoft;
++
++ if (!ipalloc_readyplus(ia,0)) return DNS_MEM;
++ ia->len = 0;
++
++ if (!stralloc_copy(&glue,sa)) return DNS_MEM;
++ if (!stralloc_0(&glue)) return DNS_MEM;
++ if (glue.s[0]) {
++   ix.pref = 0;
++   if (!glue.s[ip_scan(glue.s,&ix.addr.ip)] || !glue.s[ip_scanbracket(glue.s,&ix.addr.ip)])
++    {
++     ix.af = AF_INET;
++     if (!ipalloc_append(ia,&ix)) return DNS_MEM;
++     return 0;
++    }
++ }
++
++ switch(resolve(sa,T_MX))
++  {
++   case DNS_MEM: return DNS_MEM;
++   case DNS_SOFT: return DNS_SOFT;
++   case DNS_HARD: return dns_ip(ia,sa);
++  }
++
++ mx = (struct mx *) alloc(numanswers * sizeof(struct mx));
++ if (!mx) return DNS_MEM;
++ nummx = 0;
++
++ while ((r = findmx(T_MX)) != 2)
++  {
++   if (r == DNS_SOFT) { alloc_free(mx); return DNS_SOFT; }
++   if (r == 1)
++    {
++     mx[nummx].p = pref;
++     mx[nummx].sa.s = 0;
++     if (!stralloc_copys(&mx[nummx].sa,name))
++      {
++       while (nummx > 0) alloc_free(mx[--nummx].sa.s);
++       alloc_free(mx); return DNS_MEM;
++      }
++     ++nummx;
++    }
++  }
++
++ if (!nummx) return dns_ip(ia,sa); /* e.g., CNAME -> A */
++
++ flagsoft = 0;
++ while (nummx > 0)
++  {
++   unsigned long numsame;
++
++   i = 0;
++   numsame = 1;
++   for (j = 1;j < nummx;++j)
++     if (mx[j].p < mx[i].p)
++      {
++       i = j;
++       numsame = 1;
++      }
++     else if (mx[j].p == mx[i].p)
++      {
++       ++numsame;
++       random = random * 69069 + 1;
++       if ((random / 2) < (2147483647 / numsame))
++         i = j;
++      }
++
++   switch(dns_ipplus(ia,&mx[i].sa,mx[i].p))
++    {
++     case DNS_MEM: case DNS_SOFT:
++       flagsoft = 1; break;
++    }
++
++   alloc_free(mx[i].sa.s);
++   mx[i] = mx[--nummx];
++  }
++
++ alloc_free(mx);
++ return flagsoft;
++}
++
++
++static int dns_txtplus(ssa,sa)
++strsalloc *ssa;
++stralloc *sa;
++{
++ int r;
++
++ switch(resolve(sa,T_TXT)) 
++  {
++   case DNS_MEM: return DNS_MEM;
++   case DNS_SOFT: return DNS_SOFT;
++   case DNS_HARD: return DNS_HARD;
++  }
++ while ((r = findtxt(T_TXT)) != 2)
++  {
++   if (r == DNS_SOFT) return DNS_SOFT;
++   if (r == 1)
++    {
++     stralloc sa = {0};
++     if (!stralloc_copy(&sa,&txt)) return DNS_MEM;
++     if (!strsalloc_append(ssa,&sa)) return DNS_MEM;
++    }
++  }
++ if (ssa->len) return 0;
++ return DNS_HARD;
++}
++
++int dns_txt(ssa,sa)
++strsalloc *ssa;
++stralloc *sa;
++{
++ int r;
++ int j;
++
++ if (!strsalloc_readyplus(ssa,0)) return DNS_MEM;
++ ssa->len = 0;
++ r = dns_txtplus(ssa,sa);
++ if (r < 0)
++  {
++   for (j = 0;j < ssa->len;++j)
++    alloc_free(ssa->sa[j].s);
++   ssa->len = 0;
++  }
++ return r;
++}
+diff -rupN qmail-1.03/dnsfq.c qmail-1.03-IPv6spfptr/dnsfq.c
+--- qmail-1.03/dnsfq.c  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/dnsfq.c   2014-10-15 12:05:33.142610028 +0300
+@@ -1,3 +1,5 @@
++#include <sys/types.h>
++#include <sys/socket.h>
+ #include "substdio.h"
+ #include "subfd.h"
+ #include "stralloc.h"
+@@ -5,15 +7,19 @@
+ #include "dnsdoe.h"
+ #include "ip.h"
+ #include "ipalloc.h"
++#include "strsalloc.h"
+ #include "exit.h"
+  
+ stralloc sa = {0};
++strsalloc ssa = {0};
+ ipalloc ia = {0};
+  
+ void main(argc,argv)
+ int argc;
+ char **argv;
+ {
++ int j;
++
+  if (!argv[1]) _exit(100);
+  
+  if (!stralloc_copys(&sa,argv[1]))
+@@ -25,8 +31,18 @@ char **argv;
+   {
+    substdio_putsflush(subfderr,"no IP addresses\n"); _exit(100);
+   }
+- dnsdoe(dns_ptr(&sa,&ia.ix[0].ip));
+- substdio_putflush(subfdout,sa.s,sa.len);
+- substdio_putsflush(subfdout,"\n");
++ if (ia.ix[0].af == AF_INET)
++        dnsdoe(dns_ptr(&sa,&ia.ix[0].addr.ip));
++#ifdef INET6
++ else
++        dnsdoe(dns_ptr6(&sa,&ia.ix[0].addr.ip6));
++#endif
++
++ for(j = 0;j < ssa.len;++j)
++  {
++   substdio_putflush(subfdout,ssa.sa[j].s,ssa.sa[j].len);
++   substdio_putsflush(subfdout,"\n");
++  }
+  _exit(0);
+ }
++
+diff -rupN qmail-1.03/dnsfq.c~ qmail-1.03-IPv6spfptr/dnsfq.c~
+--- qmail-1.03/dnsfq.c~ 1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/dnsfq.c~  2014-10-15 11:59:44.622618335 +0300
+@@ -0,0 +1,41 @@
++#include <sys/types.h>
++#include <sys/socket.h>
++#include "substdio.h"
++#include "subfd.h"
++#include "stralloc.h"
++#include "dns.h"
++#include "dnsdoe.h"
++#include "ip.h"
++#include "ipalloc.h"
++#include "strsalloc.h"
++#include "exit.h"
++
++stralloc sa = {0};
++strsalloc ssa = {0};
++ipalloc ia = {0};
++
++void main(argc,argv)
++int argc;
++char **argv;
++{
++ int j;
++
++ if (!argv[1]) _exit(100);
++
++ if (!stralloc_copys(&sa,argv[1]))
++  { substdio_putsflush(subfderr,"out of memory\n"); _exit(111); }
++
++ dns_init(1);
++ dnsdoe(dns_ip(&ia,&sa));
++ if (ia.len <= 0)
++  {
++   substdio_putsflush(subfderr,"no IP addresses\n"); _exit(100);
++  }
++ dnsdoe(dns_ptr(&ssa,&ia.ix[0].ip));
++ for(j = 0;j < ssa.len;++j)
++  {
++   substdio_putflush(subfdout,ssa.sa[j].s,ssa.sa[j].len);
++   substdio_putsflush(subfdout,"\n");
++  }
++ _exit(0);
++}
+diff -rupN qmail-1.03/dns.h qmail-1.03-IPv6spfptr/dns.h
+--- qmail-1.03/dns.h    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/dns.h 2014-10-15 11:59:36.886618519 +0300
+@@ -10,5 +10,6 @@ int dns_cname();
+ int dns_mxip();
+ int dns_ip();
+ int dns_ptr();
++int dns_txt();
+  
+ #endif
+diff -rupN qmail-1.03/dnsip.c qmail-1.03-IPv6spfptr/dnsip.c
+--- qmail-1.03/dnsip.c  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/dnsip.c   2014-10-15 11:59:44.622618335 +0300
+@@ -1,3 +1,5 @@
++#include <sys/types.h>
++#include <sys/socket.h>
+ #include "substdio.h"
+ #include "subfd.h"
+ #include "stralloc.h"
+@@ -27,7 +29,19 @@ char **argv;
+  dnsdoe(dns_ip(&ia,&sa));
+  for (j = 0;j < ia.len;++j)
+   {
+-   substdio_put(subfdout,temp,ip_fmt(temp,&ia.ix[j].ip));
++   switch(ia.ix[j].af) {
++   case AF_INET:
++      substdio_put(subfdout,temp,ip_fmt(temp,&ia.ix[j].addr.ip));
++      break;
++#ifdef INET6
++   case AF_INET6:
++      substdio_put(subfdout,temp,ip6_fmt(temp,&ia.ix[j].addr.ip6));
++      break;
++#endif
++   default:
++      substdio_puts(subfdout,"Unknown address family = ");
++      substdio_put(subfdout,temp,fmt_ulong(temp,ia.ix[j].af));
++   }
+    substdio_putsflush(subfdout,"\n");
+   }
+  _exit(0);
+diff -rupN qmail-1.03/dnsmxip.c qmail-1.03-IPv6spfptr/dnsmxip.c
+--- qmail-1.03/dnsmxip.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/dnsmxip.c 2014-10-15 11:59:44.622618335 +0300
+@@ -1,3 +1,5 @@
++#include <sys/types.h>
++#include <sys/socket.h>
+ #include "substdio.h"
+ #include "subfd.h"
+ #include "stralloc.h"
+@@ -31,7 +33,19 @@ char **argv;
+  dnsdoe(dns_mxip(&ia,&sa,r));
+  for (j = 0;j < ia.len;++j)
+   {
+-   substdio_put(subfdout,temp,ip_fmt(temp,&ia.ix[j].ip));
++   switch(ia.ix[j].af) {
++   case AF_INET:
++      substdio_put(subfdout,temp,ip_fmt(temp,&ia.ix[j].addr.ip));
++      break;
++#ifdef INET6
++   case AF_INET6:
++      substdio_put(subfdout,temp,ip6_fmt(temp,&ia.ix[j].addr.ip6));
++      break;
++#endif
++   default:
++      substdio_puts(subfdout,"Unknown address family = ");
++      substdio_put(subfdout,temp,fmt_ulong(temp,ia.ix[j].af));
++   }
+    substdio_puts(subfdout," ");
+    substdio_put(subfdout,temp,fmt_ulong(temp,(unsigned long) ia.ix[j].pref));
+    substdio_putsflush(subfdout,"\n");
+diff -rupN qmail-1.03/dnsptr.c qmail-1.03-IPv6spfptr/dnsptr.c
+--- qmail-1.03/dnsptr.c 1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/dnsptr.c  2014-10-15 11:59:36.886618519 +0300
+@@ -6,22 +6,28 @@
+ #include "dns.h"
+ #include "dnsdoe.h"
+ #include "ip.h"
++#include "strsalloc.h"
+ #include "exit.h"
+  
+-stralloc sa = {0};
++strsalloc ssa = {0};
+ struct ip_address ip;
+  
+ void main(argc,argv)
+ int argc;
+ char **argv;
+ {
++ int j;
++
+  if (!argv[1]) _exit(100);
+  
+  ip_scan(argv[1],&ip);
+  
+  dns_init(0);
+- dnsdoe(dns_ptr(&sa,&ip));
+- substdio_putflush(subfdout,sa.s,sa.len);
+- substdio_putsflush(subfdout,"\n");
++ dnsdoe(dns_ptr(&ssa,&ip));
++ for(j = 0;j < ssa.len;++j)
++  {
++   substdio_putflush(subfdout,ssa.sa[j].s,ssa.sa[j].len);
++   substdio_putsflush(subfdout,"\n");
++  }
+  _exit(0);
+ }
+diff -rupN qmail-1.03/dnstxt.c qmail-1.03-IPv6spfptr/dnstxt.c
+--- qmail-1.03/dnstxt.c 1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/dnstxt.c  2014-10-15 11:59:36.886618519 +0300
+@@ -0,0 +1,32 @@
++#include "substdio.h"
++#include "subfd.h"
++#include "stralloc.h"
++#include "str.h"
++#include "scan.h"
++#include "dns.h"
++#include "dnsdoe.h"
++#include "strsalloc.h"
++#include "exit.h"
++
++strsalloc ssa = {0};
++stralloc sa = {0};
++
++void main(argc,argv)
++int argc;
++char **argv;
++{
++ int j;
++
++ if (!argv[1]) _exit(100);
++
++ if (!stralloc_copys(&sa, argv[1]))
++  { substdio_putsflush(subfderr,"out of memory\n"); _exit(111); }
++ dns_init(0);
++ dnsdoe(dns_txt(&ssa,&sa));
++ for (j = 0;j < ssa.len;++j)
++  {
++   substdio_put(subfdout,ssa.sa[j].s,ssa.sa[j].len);
++   substdio_putsflush(subfdout,"\n");
++  }
++ _exit(0);
++}
+diff -rupN qmail-1.03/error.c qmail-1.03-IPv6spfptr/error.c
+--- qmail-1.03/error.c  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/error.c   2014-10-15 11:59:44.622618335 +0300
+@@ -93,3 +93,10 @@ EACCES;
+ #else
+ -13;
+ #endif
++
++int error_refused =
++#ifdef ECONNREFUSED
++ECONNREFUSED;
++#else
++-14;
++#endif
+diff -rupN qmail-1.03/error.h qmail-1.03-IPv6spfptr/error.h
+--- qmail-1.03/error.h  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/error.h   2014-10-15 11:59:44.622618335 +0300
+@@ -16,6 +16,7 @@ extern int error_again;
+ extern int error_pipe;
+ extern int error_perm;
+ extern int error_acces;
++extern int error_refused;
+  
+ extern char *error_str();
+ extern int error_temp();
+diff -rupN qmail-1.03/FILES qmail-1.03-IPv6spfptr/FILES
+--- qmail-1.03/FILES    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/FILES 2014-10-15 11:59:36.886618519 +0300
+@@ -135,6 +135,8 @@ dnsfq.c
+ dnsip.c
+ dnsmxip.c
+ dnsptr.c
++dnstxt.c
++spfquery.c
+ hostname.c
+ ipmeprint.c
+ tcp-env.c
+@@ -335,13 +337,16 @@ envread.c
+ byte.h
+ byte_chr.c
+ byte_copy.c
++byte_cspn.c
+ byte_cr.c
+ byte_diff.c
+ byte_rchr.c
++byte_rcspn.c
+ byte_zero.c
+ str.h
+ str_chr.c
+ str_cpy.c
++str_cpyb.c
+ str_diff.c
+ str_diffn.c
+ str_len.c
+@@ -401,6 +406,8 @@ date822fmt.h
+ date822fmt.c
+ dns.h
+ dns.c
++spf.h
++spf.c
+ trylsock.c
+ tryrsolv.c
+ ip.h
+diff -rupN qmail-1.03/hier.c qmail-1.03-IPv6spfptr/hier.c
+--- qmail-1.03/hier.c   1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/hier.c    2014-10-15 11:59:44.622618335 +0300
+@@ -3,6 +3,8 @@
+ #include "auto_uids.h"
+ #include "fmt.h"
+ #include "fifo.h"
++#include "ipalloc.h"
++#include "tcpto.h"
+  
+ char buf[100 + FMT_ULONG];
+  
+@@ -60,7 +62,7 @@ void hier()
+   dsplit("queue/remote",auto_uids,0700);
+  
+   d(auto_qmail,"queue/lock",auto_uidq,auto_gidq,0750);
+-  z(auto_qmail,"queue/lock/tcpto",1024,auto_uidr,auto_gidq,0644);
++  z(auto_qmail,"queue/lock/tcpto",sizeof(struct tcpto_buf)*TCPTO_BUFSIZ,auto_uidr,auto_gidq,0644);
+   z(auto_qmail,"queue/lock/sendmutex",0,auto_uids,auto_gidq,0600);
+   p(auto_qmail,"queue/lock/trigger",auto_uids,auto_gidq,0622);
+  
+diff -rupN qmail-1.03/ipalloc.h qmail-1.03-IPv6spfptr/ipalloc.h
+--- qmail-1.03/ipalloc.h    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/ipalloc.h 2014-10-15 11:59:44.622618335 +0300
+@@ -3,7 +3,16 @@
+  
+ #include "ip.h"
+  
+-struct ip_mx { struct ip_address ip; int pref; } ;
++struct ip_mx {
++  unsigned short af;
++  union {
++    struct ip_address ip;
++#ifdef INET6
++    struct ip6_address ip6;
++#endif
++    } addr;
++  int pref;
++};
+  
+ #include "gen_alloc.h"
+  
+diff -rupN qmail-1.03/ip.c qmail-1.03-IPv6spfptr/ip.c
+--- qmail-1.03/ip.c 1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/ip.c  2014-10-15 11:59:44.622618335 +0300
+@@ -51,3 +51,32 @@ struct ip_address *ip;
+   if (s[len + 1] != ']') return 0;
+   return len + 2;
+ }
++
++#ifdef INET6
++int fmt_hexbyte(char *s, unsigned char byte)
++{
++  static char data[] = "0123456789abcdef";
++
++  if (s) {
++    *s++ = data[(byte >> 4) & 0xf];
++    *s = data[byte & 0xf];
++  }
++  return 2;
++}
++
++unsigned int ip6_fmt(s,ip6)
++char *s;
++struct ip6_address *ip6;
++{
++  unsigned int len;
++  unsigned int i, j, k;
++ 
++  len = 0;
++  for (j = 0, len = 0, k = 0; j < 8; j++) {
++    i = fmt_hexbyte(s, ip6->d[k++]); len += i; if (s) s += i;
++    i = fmt_hexbyte(s, ip6->d[k++]); len += i; if (s) s += i;
++    i = fmt_str(s,":"); len += i; if (s) s += i;
++  }
++  return len-1;
++}
++#endif
+diff -rupN qmail-1.03/ip.h qmail-1.03-IPv6spfptr/ip.h
+--- qmail-1.03/ip.h 1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/ip.h  2014-10-15 11:59:44.622618335 +0300
+@@ -2,10 +2,20 @@
+ #define IP_H
+  
+ struct ip_address { unsigned char d[4]; } ;
++#ifdef INET6
++struct ip6_address { unsigned char d[16]; } ;
++#endif
+  
+ extern unsigned int ip_fmt();
++#ifdef INET6
++extern unsigned int ip6_fmt();
++#define IPFMT 72
++#else
+ #define IPFMT 19
++#endif
+ extern unsigned int ip_scan();
+ extern unsigned int ip_scanbracket();
+  
++#define HOSTNAMELEN    1025
++
+ #endif
+diff -rupN qmail-1.03/ipme.c qmail-1.03-IPv6spfptr/ipme.c
+--- qmail-1.03/ipme.c   1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/ipme.c    2014-10-15 11:59:44.626618334 +0300
+@@ -24,11 +24,24 @@ struct ip_address *ip;
+   int i;
+   if (ipme_init() != 1) return -1;
+   for (i = 0;i < ipme.len;++i)
+-    if (byte_equal(&ipme.ix[i].ip,4,ip))
++    if (ipme.ix[i].af == AF_INET && byte_equal(&ipme.ix[i].addr.ip,4,ip))
+       return 1;
+   return 0;
+ }
+  
++#ifdef INET6
++int ipme_is6(ip)
++struct ip6_address *ip;
++{
++  int i;
++  if (ipme_init() != 1) return -1;
++  for (i = 0;i < ipme.len;++i)
++    if (ipme.ix[i].af == AF_INET6 && byte_equal(&ipme.ix[i].addr.ip6,16,ip))
++      return 1;
++  return 0;
++}
++#endif
++
+ static stralloc buf = {0};
+  
+ int ipme_init()
+@@ -37,6 +50,9 @@ int ipme_init()
+   char *x;
+   struct ifreq *ifr;
+   struct sockaddr_in *sin;
++#ifdef INET6
++  struct sockaddr_in6 *sin6;
++#endif
+   int len;
+   int s;
+   struct ip_mx ix;
+@@ -71,11 +87,22 @@ int ipme_init()
+       len = sizeof(*ifr);
+     if (ifr->ifr_addr.sa_family == AF_INET) {
+       sin = (struct sockaddr_in *) &ifr->ifr_addr;
+-      byte_copy(&ix.ip,4,&sin->sin_addr);
++      byte_copy(&ix.addr.ip,4,&sin->sin_addr);
++      ix.af = AF_INET;
++      if (ioctl(s,SIOCGIFFLAGS,x) == 0)
++        if (ifr->ifr_flags & IFF_UP)
++          if (!ipalloc_append(&ipme,&ix)) { close(s); return 0; }
++    }
++#ifdef INET6
++   else if (ifr->ifr_addr.sa_family == AF_INET6) {
++      sin6 = (struct sockaddr_in6 *) &ifr->ifr_addr;
++      byte_copy(&ix.addr.ip6,16,&sin6->sin6_addr);
++      ix.af = AF_INET6;
+       if (ioctl(s,SIOCGIFFLAGS,x) == 0)
+         if (ifr->ifr_flags & IFF_UP)
+           if (!ipalloc_append(&ipme,&ix)) { close(s); return 0; }
+     }
++#endif
+ #else
+     len = sizeof(*ifr);
+     if (ioctl(s,SIOCGIFFLAGS,x) == 0)
+@@ -83,10 +110,19 @@ int ipme_init()
+         if (ioctl(s,SIOCGIFADDR,x) == 0)
+      if (ifr->ifr_addr.sa_family == AF_INET) {
+        sin = (struct sockaddr_in *) &ifr->ifr_addr;
+-       byte_copy(&ix.ip,4,&sin->sin_addr);
++        ix.af = AF_INET;
++       byte_copy(&ix.addr.ip,4,&sin->sin_addr);
++       if (!ipalloc_append(&ipme,&ix)) { close(s); return 0; }
++     }
++#ifdef INET6
++      else if (ifr->ifr_addr.sa_family == AF_INET6) {
++       sin6 = (struct sockaddr_in6 *) &ifr->ifr_addr;
++        ix.af = AF_INET6;
++       byte_copy(&ix.addr.ip6,16,&sin6->sin6_addr);
+        if (!ipalloc_append(&ipme,&ix)) { close(s); return 0; }
+      }
+ #endif
++#endif
+     x += len;
+   }
+   close(s);
+diff -rupN qmail-1.03/ipmeprint.c qmail-1.03-IPv6spfptr/ipmeprint.c
+--- qmail-1.03/ipmeprint.c  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/ipmeprint.c   2014-10-15 11:59:44.626618334 +0300
+@@ -1,3 +1,5 @@
++#include <sys/types.h>
++#include <sys/socket.h>
+ #include "subfd.h"
+ #include "substdio.h"
+ #include "ip.h"
+@@ -16,7 +18,19 @@ void main()
+   }
+  for (j = 0;j < ipme.len;++j)
+   {
+-   substdio_put(subfdout,temp,ip_fmt(temp,&ipme.ix[j].ip));
++   switch(ipme.ix[j].af) {
++   case AF_INET:
++      substdio_put(subfdout,temp,ip_fmt(temp,&ipme.ix[j].addr.ip));
++      break;
++#ifdef INET6
++   case AF_INET6:
++      substdio_put(subfdout,temp,ip6_fmt(temp,&ipme.ix[j].addr.ip6));
++      break;
++#endif
++   default:
++      substdio_puts(subfdout,"Unknown address family = ");
++      substdio_put(subfdout,temp,fmt_ulong(temp,ipme.ix[j].af));
++   }
+    substdio_puts(subfdout,"\n");
+   }
+  substdio_flush(subfdout);
+diff -rupN qmail-1.03/Makefile qmail-1.03-IPv6spfptr/Makefile
+--- qmail-1.03/Makefile 1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/Makefile  2014-10-15 11:59:36.886618519 +0300
+@@ -203,6 +203,10 @@ byte_cr.o: \
+ compile byte_cr.c byte.h
+    ./compile byte_cr.c
+  
++byte_cspn.o: \
++compile byte_cspn.c byte.h
++   ./compile byte_cspn.c
++
+ byte_diff.o: \
+ compile byte_diff.c byte.h
+    ./compile byte_diff.c
+@@ -211,6 +215,10 @@ byte_rchr.o: \
+ compile byte_rchr.c byte.h
+    ./compile byte_rchr.c
+  
++byte_rcspn.o: \
++compile byte_rcspn.c byte.h
++   ./compile byte_rcspn.c
++
+ byte_zero.o: \
+ compile byte_zero.c byte.h
+    ./compile byte_zero.c
+@@ -393,84 +401,96 @@ compile trydrent.c direntry.h1 direntry.
+    rm -f trydrent.o
+  
+ dns.lib: \
+-tryrsolv.c compile load socket.lib dns.o ipalloc.o ip.o stralloc.a \
+-alloc.a error.a fs.a str.a
++tryrsolv.c compile load socket.lib dns.o ipalloc.o strsalloc.o ip.o \
++stralloc.a alloc.a error.a fs.a str.a
+    ( ( ./compile tryrsolv.c && ./load tryrsolv dns.o \
+-   ipalloc.o ip.o stralloc.a alloc.a error.a fs.a str.a \
++   ipalloc.o strsalloc.o ip.o stralloc.a alloc.a error.a fs.a str.a \
+    -lresolv `cat socket.lib` ) >/dev/null 2>&1 \
+    && echo -lresolv || exit 0 ) > dns.lib
+    rm -f tryrsolv.o tryrsolv
+  
+ dns.o: \
+-compile dns.c ip.h ipalloc.h ip.h gen_alloc.h fmt.h alloc.h str.h \
+-stralloc.h gen_alloc.h dns.h case.h
++compile dns.c ip.h ipalloc.h strsalloc.h gen_alloc.h fmt.h alloc.h \
++str.h stralloc.h dns.h case.h
+    ./compile dns.c
+  
+ dnscname: \
+-load dnscname.o dns.o dnsdoe.o ip.o ipalloc.o stralloc.a alloc.a \
++load dnscname.o dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a alloc.a \
+ substdio.a error.a str.a fs.a dns.lib socket.lib
+-   ./load dnscname dns.o dnsdoe.o ip.o ipalloc.o stralloc.a \
++   ./load dnscname dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a \
+    alloc.a substdio.a error.a str.a fs.a  `cat dns.lib` `cat \
+    socket.lib`
+  
+ dnscname.o: \
+-compile dnscname.c substdio.h subfd.h substdio.h stralloc.h \
++compile dnscname.c substdio.h subfd.h stralloc.h \
+ gen_alloc.h dns.h dnsdoe.h readwrite.h exit.h
+    ./compile dnscname.c
+  
+ dnsdoe.o: \
+-compile dnsdoe.c substdio.h subfd.h substdio.h exit.h dns.h dnsdoe.h
++compile dnsdoe.c substdio.h subfd.h exit.h dns.h dnsdoe.h
+    ./compile dnsdoe.c
+  
+ dnsfq: \
+-load dnsfq.o dns.o dnsdoe.o ip.o ipalloc.o stralloc.a alloc.a \
++load dnsfq.o dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a alloc.a \
+ substdio.a error.a str.a fs.a dns.lib socket.lib
+-   ./load dnsfq dns.o dnsdoe.o ip.o ipalloc.o stralloc.a \
++   ./load dnsfq dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a \
+    alloc.a substdio.a error.a str.a fs.a  `cat dns.lib` `cat \
+    socket.lib`
+  
+ dnsfq.o: \
+-compile dnsfq.c substdio.h subfd.h substdio.h stralloc.h gen_alloc.h \
+-dns.h dnsdoe.h ip.h ipalloc.h ip.h gen_alloc.h exit.h
++compile dnsfq.c substdio.h subfd.h stralloc.h gen_alloc.h \
++dns.h dnsdoe.h ip.h ipalloc.h strsalloc.h exit.h
+    ./compile dnsfq.c
+  
+ dnsip: \
+-load dnsip.o dns.o dnsdoe.o ip.o ipalloc.o stralloc.a alloc.a \
++load dnsip.o dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a alloc.a \
+ substdio.a error.a str.a fs.a dns.lib socket.lib
+-   ./load dnsip dns.o dnsdoe.o ip.o ipalloc.o stralloc.a \
++   ./load dnsip dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a \
+    alloc.a substdio.a error.a str.a fs.a  `cat dns.lib` `cat \
+    socket.lib`
+  
+ dnsip.o: \
+-compile dnsip.c substdio.h subfd.h substdio.h stralloc.h gen_alloc.h \
+-dns.h dnsdoe.h ip.h ipalloc.h ip.h gen_alloc.h exit.h
++compile dnsip.c substdio.h subfd.h stralloc.h gen_alloc.h \
++dns.h dnsdoe.h ip.h ipalloc.h strsalloc.h exit.h
+    ./compile dnsip.c
+  
+ dnsmxip: \
+-load dnsmxip.o dns.o dnsdoe.o ip.o ipalloc.o now.o stralloc.a alloc.a \
+-substdio.a error.a str.a fs.a dns.lib socket.lib
+-   ./load dnsmxip dns.o dnsdoe.o ip.o ipalloc.o now.o \
++load dnsmxip.o dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o now.o stralloc.a \
++alloc.a substdio.a error.a str.a fs.a dns.lib socket.lib
++   ./load dnsmxip dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o now.o \
+    stralloc.a alloc.a substdio.a error.a str.a fs.a  `cat \
+    dns.lib` `cat socket.lib`
+  
+ dnsmxip.o: \
+-compile dnsmxip.c substdio.h subfd.h substdio.h stralloc.h \
+-gen_alloc.h fmt.h dns.h dnsdoe.h ip.h ipalloc.h ip.h gen_alloc.h \
++compile dnsmxip.c substdio.h subfd.h stralloc.h \
++gen_alloc.h fmt.h dns.h dnsdoe.h ip.h ipalloc.h strsalloc.h \
+ now.h datetime.h exit.h
+    ./compile dnsmxip.c
+  
+ dnsptr: \
+-load dnsptr.o dns.o dnsdoe.o ip.o ipalloc.o stralloc.a alloc.a \
++load dnsptr.o dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a alloc.a \
+ substdio.a error.a str.a fs.a dns.lib socket.lib
+-   ./load dnsptr dns.o dnsdoe.o ip.o ipalloc.o stralloc.a \
++   ./load dnsptr dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a \
+    alloc.a substdio.a error.a str.a fs.a  `cat dns.lib` `cat \
+    socket.lib`
+  
+ dnsptr.o: \
+-compile dnsptr.c substdio.h subfd.h substdio.h stralloc.h gen_alloc.h \
++compile dnsptr.c substdio.h subfd.h stralloc.h gen_alloc.h \
+ str.h scan.h dns.h dnsdoe.h ip.h exit.h
+    ./compile dnsptr.c
+  
++dnstxt: \
++load dnstxt.o dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a alloc.a \
++substdio.a error.a str.a fs.a dns.lib socket.lib
++   ./load dnstxt dns.o dnsdoe.o ip.o ipalloc.o strsalloc.o stralloc.a \
++   alloc.a substdio.a error.a str.a fs.a  `cat dns.lib` `cat \
++   socket.lib`
++
++dnstxt.o: \
++compile dnstxt.c substdio.h subfd.h stralloc.h gen_alloc.h \
++str.h scan.h dns.h dnsdoe.h ip.h exit.h
++   ./compile dnstxt.c
++
+ dot-qmail.0: \
+ dot-qmail.5
+    nroff -man dot-qmail.5 > dot-qmail.0
+@@ -777,24 +797,24 @@ compile ip.c fmt.h scan.h ip.h
+    ./compile ip.c
+  
+ ipalloc.o: \
+-compile ipalloc.c alloc.h gen_allocdefs.h ip.h ipalloc.h ip.h \
++compile ipalloc.c alloc.h gen_allocdefs.h ip.h ipalloc.h \
+ gen_alloc.h
+    ./compile ipalloc.c
+  
+ ipme.o: \
+-compile ipme.c hassalen.h byte.h ip.h ipalloc.h ip.h gen_alloc.h \
+-stralloc.h gen_alloc.h ipme.h ip.h ipalloc.h
++compile ipme.c hassalen.h byte.h ip.h ipalloc.h strsalloc.h ip.h gen_alloc.h \
++stralloc.h gen_alloc.h ipme.h ip.h ipalloc.h strsalloc.h
+    ./compile ipme.c
+  
+ ipmeprint: \
+-load ipmeprint.o ipme.o ip.o ipalloc.o stralloc.a alloc.a substdio.a \
+-error.a str.a fs.a socket.lib
+-   ./load ipmeprint ipme.o ip.o ipalloc.o stralloc.a alloc.a \
+-   substdio.a error.a str.a fs.a  `cat socket.lib`
++load ipmeprint.o ipme.o ip.o ipalloc.o strsalloc.o stralloc.a alloc.a \
++substdio.a error.a str.a fs.a socket.lib
++   ./load ipmeprint ipme.o ip.o ipalloc.o strsalloc.o stralloc.a \
++   alloc.a substdio.a error.a str.a fs.a `cat socket.lib`
+  
+ ipmeprint.o: \
+ compile ipmeprint.c subfd.h substdio.h substdio.h ip.h ipme.h ip.h \
+-ipalloc.h ip.h gen_alloc.h exit.h
++ipalloc.h strsalloc.h ip.h gen_alloc.h exit.h
+    ./compile ipmeprint.c
+  
+ it: \
+@@ -804,11 +824,11 @@ predate datemail mailsubj qmail-upq qmai
+ qmail-pw2u qmail-qread qmail-qstat qmail-tcpto qmail-tcpok \
+ qmail-pop3d qmail-popup qmail-qmqpc qmail-qmqpd qmail-qmtpd \
+ qmail-smtpd sendmail tcp-env qmail-newmrh config config-fast dnscname \
+-dnsptr dnsip dnsmxip dnsfq hostname ipmeprint qreceipt qsmhook qbiff \
++dnsptr dnsip dnsmxip dnsfq dnstxt hostname ipmeprint qreceipt qsmhook qbiff \
+ forward preline condredirect bouncesaying except maildirmake \
+ maildir2mbox maildirwatch qail elq pinq idedit install-big install \
+ instcheck home home+df proc proc+df binm1 binm1+df binm2 binm2+df \
+-binm3 binm3+df
++binm3 binm3+df spfquery
+  
+ load: \
+ make-load warn-auto.sh systype
+@@ -1439,12 +1459,12 @@ auto_qmail.h auto_uids.h date822fmt.h fm
+  
+ qmail-remote: \
+ load qmail-remote.o control.o constmap.o timeoutread.o timeoutwrite.o \
+-timeoutconn.o tcpto.o now.o dns.o ip.o ipalloc.o ipme.o quote.o \
++timeoutconn.o tcpto.o now.o dns.o ip.o ipalloc.o strsalloc.o ipme.o quote.o \
+ ndelay.a case.a sig.a open.a lock.a seek.a getln.a stralloc.a alloc.a \
+ substdio.a error.a str.a fs.a auto_qmail.o dns.lib socket.lib
+    ./load qmail-remote control.o constmap.o timeoutread.o \
+    timeoutwrite.o timeoutconn.o tcpto.o now.o dns.o ip.o \
+-   ipalloc.o ipme.o quote.o ndelay.a case.a sig.a open.a \
++   ipalloc.o strsalloc.o ipme.o quote.o ndelay.a case.a sig.a open.a \
+    lock.a seek.a getln.a stralloc.a alloc.a substdio.a error.a \
+    str.a fs.a auto_qmail.o  `cat dns.lib` `cat socket.lib`
+  
+@@ -1455,7 +1475,7 @@ qmail-remote.8
+ qmail-remote.o: \
+ compile qmail-remote.c sig.h stralloc.h gen_alloc.h substdio.h \
+ subfd.h substdio.h scan.h case.h error.h auto_qmail.h control.h dns.h \
+-alloc.h quote.h ip.h ipalloc.h ip.h gen_alloc.h ipme.h ip.h ipalloc.h \
++alloc.h quote.h ip.h ipalloc.h strsalloc.h ip.h gen_alloc.h ipme.h ip.h ipalloc.h strsalloc.h \
+ gen_alloc.h gen_allocdefs.h str.h now.h datetime.h exit.h constmap.h \
+ tcpto.h readwrite.h timeoutconn.h timeoutread.h timeoutwrite.h
+    ./compile qmail-remote.c
+@@ -1528,21 +1548,21 @@ qmail-showctl.o: \
+ compile qmail-showctl.c substdio.h subfd.h substdio.h exit.h fmt.h \
+ str.h control.h constmap.h stralloc.h gen_alloc.h direntry.h \
+ auto_uids.h auto_qmail.h auto_break.h auto_patrn.h auto_spawn.h \
+-auto_split.h
++auto_split.h spf.h
+    ./compile qmail-showctl.c
+  
+ qmail-smtpd: \
+ load qmail-smtpd.o rcpthosts.o commands.o timeoutread.o \
+-timeoutwrite.o ip.o ipme.o ipalloc.o control.o constmap.o received.o \
+-date822fmt.o now.o qmail.o cdb.a fd.a wait.a datetime.a getln.a \
+-open.a sig.a case.a env.a stralloc.a alloc.a substdio.a error.a str.a \
+-fs.a auto_qmail.o socket.lib
++timeoutwrite.o ip.o ipme.o ipalloc.o strsalloc.o control.o constmap.o \
++received.o date822fmt.o now.o qmail.o spf.o dns.o cdb.a fd.a wait.a \
++datetime.a getln.a open.a sig.a case.a env.a stralloc.a alloc.a substdio.a \
++error.a str.a fs.a auto_qmail.o socket.lib dns.lib
+    ./load qmail-smtpd rcpthosts.o commands.o timeoutread.o \
+-   timeoutwrite.o ip.o ipme.o ipalloc.o control.o constmap.o \
+-   received.o date822fmt.o now.o qmail.o cdb.a fd.a wait.a \
+-   datetime.a getln.a open.a sig.a case.a env.a stralloc.a \
+-   alloc.a substdio.a error.a str.a fs.a auto_qmail.o  `cat \
+-   socket.lib`
++   timeoutwrite.o ip.o ipme.o ipalloc.o strsalloc.o control.o \
++   constmap.o received.o date822fmt.o now.o qmail.o spf.o dns.o cdb.a \
++   fd.a wait.a datetime.a getln.a open.a sig.a case.a env.a stralloc.a \
++   alloc.a substdio.a error.a fs.a auto_qmail.o \
++   str.a `cat socket.lib` `cat dns.lib`
+  
+ qmail-smtpd.0: \
+ qmail-smtpd.8
+@@ -1551,9 +1571,9 @@ qmail-smtpd.8
+ qmail-smtpd.o: \
+ compile qmail-smtpd.c sig.h readwrite.h stralloc.h gen_alloc.h \
+ substdio.h alloc.h auto_qmail.h control.h received.h constmap.h \
+-error.h ipme.h ip.h ipalloc.h ip.h gen_alloc.h ip.h qmail.h \
++error.h ipme.h ip.h ipalloc.h strsalloc.h ip.h gen_alloc.h ip.h qmail.h \
+ substdio.h str.h fmt.h scan.h byte.h case.h env.h now.h datetime.h \
+-exit.h rcpthosts.h timeoutread.h timeoutwrite.h commands.h
++exit.h rcpthosts.h timeoutread.h timeoutwrite.h commands.h spf.h
+    ./compile qmail-smtpd.c
+  
+ qmail-start: \
+@@ -1779,7 +1799,7 @@ qmail-popup.c qmail-pw2u.c qmail-qmqpc.c
+ qmail-qread.c qmail-qstat.sh qmail-queue.c qmail-remote.c \
+ qmail-rspawn.c qmail-send.c qmail-showctl.c qmail-smtpd.c \
+ qmail-start.c qmail-tcpok.c qmail-tcpto.c spawn.c dnscname.c dnsfq.c \
+-dnsip.c dnsmxip.c dnsptr.c hostname.c ipmeprint.c tcp-env.c \
++dnsip.c dnsmxip.c dnsptr.c dnstxt.c hostname.c ipmeprint.c tcp-env.c \
+ sendmail.c qreceipt.c qsmhook.c qbiff.c forward.c preline.c predate.c \
+ except.c bouncesaying.c condredirect.c maildirmake.c maildir2mbox.c \
+ maildirwatch.c splogger.c qail.sh elq.sh pinq.sh qmail-upq.sh \
+@@ -1813,8 +1833,9 @@ uint32.h2 tryulong32.c wait.3 wait.h wai
+ trywaitp.c sig.h sig_alarm.c sig_block.c sig_catch.c sig_pause.c \
+ sig_pipe.c sig_child.c sig_term.c sig_hup.c sig_misc.c sig_bug.c \
+ trysgact.c trysgprm.c env.3 env.h env.c envread.c byte.h byte_chr.c \
+-byte_copy.c byte_cr.c byte_diff.c byte_rchr.c byte_zero.c str.h \
+-str_chr.c str_cpy.c str_diff.c str_diffn.c str_len.c str_rchr.c \
++byte_copy.c byte_cr.c byte_cspn.c byte_diff.c byte_rchr.c byte_rcspn.c \
++byte_zero.c str.h spf.c spf.h spfquery.c \
++str_chr.c str_cpy.c str_cpyb.c str_diff.c str_diffn.c str_len.c str_rchr.c \
+ str_start.c lock.h lock_ex.c lock_exnb.c lock_un.c tryflock.c getln.3 \
+ getln.h getln.c getln2.3 getln2.c sgetopt.3 sgetopt.h sgetopt.c \
+ subgetopt.3 subgetopt.h subgetopt.c error.3 error_str.3 error_temp.3 \
+@@ -1824,7 +1845,7 @@ slurpclose.h slurpclose.c quote.h quote.
+ headerbody.h headerbody.c token822.h token822.c control.h control.c \
+ datetime.3 datetime.h datetime.c datetime_un.c prioq.h prioq.c \
+ date822fmt.h date822fmt.c dns.h dns.c trylsock.c tryrsolv.c ip.h ip.c \
+-ipalloc.h ipalloc.c select.h1 select.h2 trysysel.c ndelay.h ndelay.c \
++ipalloc.h strsalloc.h ipalloc.c select.h1 select.h2 trysysel.c ndelay.h ndelay.c \
+ ndelay_off.c direntry.3 direntry.h1 direntry.h2 trydrent.c prot.h \
+ prot.c chkshsgr.c warn-shsgr tryshsgr.c ipme.h ipme.c trysalen.c \
+ maildir.5 maildir.h maildir.c tcp-environ.5 constmap.h constmap.c
+@@ -1897,6 +1918,23 @@ auto_qmail.h auto_uids.h auto_spawn.h
+    ./chkspawn
+    ./compile spawn.c
+  
++spf.o: \
++compile spf.c stralloc.h gen_alloc.h alloc.h ipme.h ip.h ipalloc.h \
++strsalloc.h str.h fmt.h scan.h byte.h now.h case.h
++   ./compile spf.c
++
++spfquery: \
++load spfquery.o spf.o ip.o ipme.o ipalloc.o strsalloc.o now.o dns.o \
++datetime.a stralloc.a alloc.a str.a substdio.a error.a fs.a case.a dns.lib
++   ./load spfquery spf.o ip.o ipme.o ipalloc.o strsalloc.o \
++   now.o dns.o datetime.a stralloc.a alloc.a str.a substdio.a \
++   case.a error.a fs.a `cat dns.lib` `cat socket.lib`
++
++spfquery.o: \
++compile spfquery.c substdio.h subfd.h stralloc.h gen_alloc.h alloc.h \
++spf.h exit.h
++   ./compile spfquery.c
++
+ splogger: \
+ load splogger.o substdio.a error.a str.a fs.a syslog.lib socket.lib
+    ./load splogger substdio.a error.a str.a fs.a  `cat \
+@@ -1912,12 +1950,12 @@ scan.h fmt.h
+    ./compile splogger.c
+  
+ str.a: \
+-makelib str_len.o str_diff.o str_diffn.o str_cpy.o str_chr.o \
+-str_rchr.o str_start.o byte_chr.o byte_rchr.o byte_diff.o byte_copy.o \
+-byte_cr.o byte_zero.o
+-   ./makelib str.a str_len.o str_diff.o str_diffn.o str_cpy.o \
+-   str_chr.o str_rchr.o str_start.o byte_chr.o byte_rchr.o \
+-   byte_diff.o byte_copy.o byte_cr.o byte_zero.o
++makelib str_len.o str_diff.o str_diffn.o str_cpy.o str_cpyb.o str_chr.o \
++str_rchr.o str_start.o byte_chr.o byte_rchr.o byte_cspn.o byte_rcspn.o \
++byte_diff.o byte_copy.o byte_cr.o byte_zero.o
++   ./makelib str.a str_len.o str_diff.o str_diffn.o str_cpy.o str_cpyb.o \
++   str_chr.o str_rchr.o str_start.o byte_chr.o byte_rchr.o byte_cspn.o \
++   byte_rcspn.o byte_diff.o byte_copy.o byte_cr.o byte_zero.o
+  
+ str_chr.o: \
+ compile str_chr.c str.h
+@@ -1927,6 +1965,10 @@ str_cpy.o: \
+ compile str_cpy.c str.h
+    ./compile str_cpy.c
+  
++str_cpyb.o: \
++compile str_cpyb.c str.h
++   ./compile str_cpyb.c
++
+ str_diff.o: \
+ compile str_diff.c str.h
+    ./compile str_diff.c
+@@ -2006,6 +2048,11 @@ strerr_sys.o: \
+ compile strerr_sys.c error.h strerr.h
+    ./compile strerr_sys.c
+  
++strsalloc.o: \
++compile strsalloc.c alloc.h gen_allocdefs.h stralloc.h strsalloc.h \
++gen_alloc.h
++   ./compile strsalloc.c
++
+ subfderr.o: \
+ compile subfderr.c readwrite.h substdio.h subfd.h substdio.h
+    ./compile subfderr.c
+@@ -2066,11 +2113,11 @@ find-systype trycpp.c
+  
+ tcp-env: \
+ load tcp-env.o dns.o remoteinfo.o timeoutread.o timeoutwrite.o \
+-timeoutconn.o ip.o ipalloc.o case.a ndelay.a sig.a env.a getopt.a \
+-stralloc.a alloc.a substdio.a error.a str.a fs.a dns.lib socket.lib
++timeoutconn.o ip.o ipalloc.o strsalloc.o case.a ndelay.a sig.a env.a \
++getopt.a stralloc.a alloc.a substdio.a error.a str.a fs.a dns.lib socket.lib
+    ./load tcp-env dns.o remoteinfo.o timeoutread.o \
+-   timeoutwrite.o timeoutconn.o ip.o ipalloc.o case.a ndelay.a \
+-   sig.a env.a getopt.a stralloc.a alloc.a substdio.a error.a \
++   timeoutwrite.o timeoutconn.o ip.o ipalloc.o strsalloc.o case.a \
++   ndelay.a sig.a env.a getopt.a stralloc.a alloc.a substdio.a error.a \
+    str.a fs.a  `cat dns.lib` `cat socket.lib`
+  
+ tcp-env.0: \
+diff -rupN qmail-1.03/qmail-control.9 qmail-1.03-IPv6spfptr/qmail-control.9
+--- qmail-1.03/qmail-control.9  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-control.9   2014-10-15 11:59:36.886618519 +0300
+@@ -63,6 +63,10 @@ control  default used by
+ .I rcpthosts   \fR(none)   \fRqmail-smtpd
+ .I smtpgreeting    \fIme   \fRqmail-smtpd
+ .I smtproutes  \fR(none)   \fRqmail-remote
++.I spfbehavior \fR0    \fRqmail-smtpd
++.I spfexp  \fR(default)    \fRqmail-smtpd
++.I spfguess    \fR(none)   \fRqmail-smtpd
++.I spfrules    \fR(none)   \fRqmail-smtpd
+ .I timeoutconnect  \fR60   \fRqmail-remote
+ .I timeoutremote   \fR1200 \fRqmail-remote
+ .I timeoutsmtpd    \fR1200 \fRqmail-smtpd
+diff -rupN qmail-1.03/qmail-remote.c qmail-1.03-IPv6spfptr/qmail-remote.c
+--- qmail-1.03/qmail-remote.c   1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-remote.c    2014-10-15 11:59:44.626618334 +0300
+@@ -46,7 +46,7 @@ stralloc sender = {0};
+  
+ saa reciplist = {0};
+  
+-struct ip_address partner;
++struct ip_mx partner;
+  
+ void out(s) char *s; { if (substdio_puts(subfdoutsmall,s) == -1) _exit(0); }
+ void zero() { if (substdio_put(subfdoutsmall,"\0",1) == -1) _exit(0); }
+@@ -89,7 +89,15 @@ zerodie(); }
+ void outhost()
+ {
+   char x[IPFMT];
+-  if (substdio_put(subfdoutsmall,x,ip_fmt(x,&partner)) == -1) _exit(0);
++#ifdef INET6
++  if (partner.af == AF_INET) {
++#endif
++  if (substdio_put(subfdoutsmall,x,ip_fmt(x,&partner.addr.ip)) == -1) _exit(0);
++#ifdef INET6
++  } else {
++  if (substdio_put(subfdoutsmall,x,ip6_fmt(x,&partner.addr.ip6)) == -1) _exit(0);
++  }
++#endif
+ }
+  
+ int flagcritical = 0;
+@@ -326,6 +334,33 @@ void getcontrols()
+   }
+ }
+  
++#ifdef INET6
++int ipme_is46(mxip)
++struct ip_mx *mxip;
++{
++  switch(mxip->af) {
++  case AF_INET:
++    return ipme_is(&mxip->addr.ip);
++  case AF_INET6:
++    return ipme_is6(&mxip->addr.ip6);
++  }
++  return 0;
++}
++#endif
++
++int timeoutconn46(fd, ix, port, timeout)
++int fd;
++struct ip_mx *ix;
++int port;
++int timeout;
++{
++#ifdef INET6
++   if (ix->af == AF_INET6)
++       return timeoutconn6(fd, &ix->addr.ip6, port, timeout);
++#endif
++   return timeoutconn(fd, &ix->addr.ip, port, timeout);
++}
++
+ void main(argc,argv)
+ int argc;
+ char **argv;
+@@ -394,7 +429,11 @@ char **argv;
+   
+   prefme = 100000;
+   for (i = 0;i < ip.len;++i)
+-    if (ipme_is(&ip.ix[i].ip))
++#ifdef INET6
++   if (ipme_is46(&ip.ix[i]))
++#else
++   if (ipme_is(&ip.ix[i].addr.ip))
++#endif
+       if (ip.ix[i].pref < prefme)
+         prefme = ip.ix[i].pref;
+   
+@@ -409,17 +448,22 @@ char **argv;
+     perm_ambigmx();
+   
+   for (i = 0;i < ip.len;++i) if (ip.ix[i].pref < prefme) {
+-    if (tcpto(&ip.ix[i].ip)) continue;
++    if (tcpto(&ip.ix[i])) continue;
+   
+-    smtpfd = socket(AF_INET,SOCK_STREAM,0);
++    smtpfd = socket(ip.ix[i].af,SOCK_STREAM,0);
+     if (smtpfd == -1) temp_oserr();
+   
+-    if (timeoutconn(smtpfd,&ip.ix[i].ip,(unsigned int) port,timeoutconnect) == 0) {
+-      tcpto_err(&ip.ix[i].ip,0);
+-      partner = ip.ix[i].ip;
++    if (timeoutconn46(smtpfd,&ip.ix[i],(unsigned int) port,timeoutconnect) == 0)
++   {
++      tcpto_err(&ip.ix[i],0);
++      partner = ip.ix[i];
+       smtp(); /* does not return */
+     }
+-    tcpto_err(&ip.ix[i].ip,errno == error_timeout);
++    tcpto_err(&ip.ix[i],errno == error_timeout
++#ifdef TCPTO_REFUSED
++           || errno == error_refused
++#endif
++    );
+     close(smtpfd);
+   }
+    
+diff -rupN qmail-1.03/qmail-rspawn.c qmail-1.03-IPv6spfptr/qmail-rspawn.c
+--- qmail-1.03/qmail-rspawn.c   1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-rspawn.c    2014-10-15 11:59:44.626618334 +0300
+@@ -4,6 +4,7 @@
+ #include "exit.h"
+ #include "fork.h"
+ #include "error.h"
++#include "ipalloc.h"
+ #include "tcpto.h"
+  
+ void initialize(argc,argv)
+diff -rupN qmail-1.03/qmail-showctl.c qmail-1.03-IPv6spfptr/qmail-showctl.c
+--- qmail-1.03/qmail-showctl.c  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-showctl.c   2014-10-15 11:59:36.886618519 +0300
+@@ -15,6 +15,7 @@
+ #include "auto_patrn.h"
+ #include "auto_spawn.h"
+ #include "auto_split.h"
++#include "spf.h"
+  
+ stralloc me = {0};
+ int meok;
+@@ -257,6 +258,10 @@ void main()
+  
+   do_str("smtpgreeting",1,"smtpgreeting","SMTP greeting: 220 ");
+   do_lst("smtproutes","No artificial SMTP routes.","SMTP route: ","");
++  do_int("spfbehavior","0","The SPF behavior is ","");
++  do_str("spfexp",0,SPF_DEFEXP,"The SPF default explanation is: 550 ");
++  do_str("spfguess",0,"","The guess SPF rules are: ");
++  do_str("spfrules",0,"","The local SPF rules are: ");
+   do_int("timeoutconnect","60","SMTP client connection timeout is "," seconds");
+   do_int("timeoutremote","1200","SMTP client data timeout is "," seconds");
+   do_int("timeoutsmtpd","1200","SMTP server data timeout is "," seconds");
+@@ -292,6 +297,10 @@ void main()
+     if (str_equal(d->d_name,"rcpthosts")) continue;
+     if (str_equal(d->d_name,"smtpgreeting")) continue;
+     if (str_equal(d->d_name,"smtproutes")) continue;
++    if (str_equal(d->d_name,"spfbehavior")) continue;
++    if (str_equal(d->d_name,"spfexp")) continue;
++    if (str_equal(d->d_name,"spfguess")) continue;
++    if (str_equal(d->d_name,"spfrules")) continue;
+     if (str_equal(d->d_name,"timeoutconnect")) continue;
+     if (str_equal(d->d_name,"timeoutremote")) continue;
+     if (str_equal(d->d_name,"timeoutsmtpd")) continue;
+diff -rupN qmail-1.03/qmail-smtpd.8 qmail-1.03-IPv6spfptr/qmail-smtpd.8
+--- qmail-1.03/qmail-smtpd.8    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-smtpd.8 2014-10-15 11:59:36.886618519 +0300
+@@ -169,6 +169,41 @@ Number of seconds
+ .B qmail-smtpd
+ will wait for each new buffer of data from the remote SMTP client.
+ Default: 1200.
++.TP 5
++.I spfbehavior
++Set to a value between 1 and 6 to enable SPF checks; 0 to disable.
++1 selects 'annotate-only' mode, where
++.B qmail-smtpd
++will annotate incoming email with
++.B Received-SPF
++fields, but will not reject any messages.  2 will produce temporary
++failures on DNS lookup problems so you can make sure you always have
++meaningful Received-SPF headers.  3 selects 'reject' mode,
++where incoming mail will be rejected if the SPF record says 'fail'.  4
++selects a more stricter rejection mode, which is like 'reject' mode,
++except that incoming mail will also be rejected when the SPF record
++says 'softfail'.  5 will also reject when the SPF record says 'neutral',
++and 6 if no SPF records are available at all (or a syntax error was
++encountered). The contents of this file are overridden by the value of
++the
++.B SPFBEHAVIOR
++environment variable, if set.
++Default: 0.
++.TP 5
++.I spfexp
++You can add a line with a an SPF explanation that will be shown to the
++sender in case of a reject. It will override the default one. You can
++use SPF macro expansion.
++.TP 5
++.I spfguess
++You can add a line with SPF rules that will be checked if a sender
++domain doesn't have a SPF record. The local rules will also be used
++in this case.
++.TP 5
++.I spfrules
++You can add a line with SPF rules that will be checked before other SPF
++rules would fail.  This can be used to always allow certain machines to
++send certain mails.
+ .SH "SEE ALSO"
+ tcp-env(1),
+ tcp-environ(5),
+diff -rupN qmail-1.03/qmail-smtpd.c qmail-1.03-IPv6spfptr/qmail-smtpd.c
+--- qmail-1.03/qmail-smtpd.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-smtpd.c 2014-10-15 11:59:36.890618519 +0300
+@@ -23,10 +23,12 @@
+ #include "timeoutread.h"
+ #include "timeoutwrite.h"
+ #include "commands.h"
++#include "spf.h"
+  
+ #define MAXHOPS 100
+ unsigned int databytes = 0;
+ int timeout = 1200;
++unsigned int spfbehavior = 0;
+  
+ int safewrite(fd,buf,len) int fd; char *buf; int len;
+ {
+@@ -61,6 +63,9 @@ void err_qqt() { out("451 qqt failure (#
+  
+  
+ stralloc greeting = {0};
++stralloc spflocal = {0};
++stralloc spfguess = {0};
++stralloc spfexp = {0};
+  
+ void smtp_greet(code) char *code;
+ {
+@@ -122,6 +127,19 @@ void setup()
+   if (x) { scan_ulong(x,&u); databytes = u; }
+   if (!(databytes + 1)) --databytes;
+   
++  if (control_readint(&spfbehavior,"control/spfbehavior") == -1)
++    die_control();
++  x = env_get("SPFBEHAVIOR");
++  if (x) { scan_ulong(x,&u); spfbehavior = u; }
++
++  if (control_readline(&spflocal,"control/spfrules") == -1) die_control();
++  if (spflocal.len && !stralloc_0(&spflocal)) die_nomem();
++  if (control_readline(&spfguess,"control/spfguess") == -1) die_control();
++  if (spfguess.len && !stralloc_0(&spfguess)) die_nomem();
++  if (control_rldef(&spfexp,"control/spfexp",0,SPF_DEFEXP) == -1)
++    die_control();
++  if (!stralloc_0(&spfexp)) die_nomem();
++
+   remoteip = env_get("TCPREMOTEIP");
+   if (!remoteip) remoteip = "unknown";
+   local = env_get("TCPLOCALHOST");
+@@ -219,6 +237,8 @@ int addrallowed()
+  
+ int seenmail = 0;
+ int flagbarf; /* defined if seenmail */
++int flagbarfspf;
++stralloc spfbarfmsg = {0};
+ stralloc mailfrom = {0};
+ stralloc rcptto = {0};
+  
+@@ -237,20 +257,79 @@ void smtp_rset()
+   seenmail = 0;
+   out("250 flushed\r\n");
+ }
++
+ void smtp_mail(arg) char *arg;
+ {
++  int r;
++
+   if (!addrparse(arg)) { err_syntax(); return; }
+   flagbarf = bmfcheck();
++  flagbarfspf = 0;
++  if (spfbehavior && !relayclient)
++   { 
++    switch(r = spfcheck()) {
++    case SPF_OK: env_put2("SPFRESULT","pass"); break;
++    case SPF_NONE: env_put2("SPFRESULT","none"); break;
++    case SPF_UNKNOWN: env_put2("SPFRESULT","unknown"); break;
++    case SPF_NEUTRAL: env_put2("SPFRESULT","neutral"); break;
++    case SPF_SOFTFAIL: env_put2("SPFRESULT","softfail"); break;
++    case SPF_FAIL: env_put2("SPFRESULT","fail"); break;
++    case SPF_ERROR: env_put2("SPFRESULT","error"); break;
++    }
++    switch (r) {
++    case SPF_NOMEM:
++      die_nomem();
++    case SPF_ERROR:
++      if (spfbehavior < 2) break;
++      out("451 SPF lookup failure (#4.3.0)\r\n");
++      return;
++    case SPF_NONE:
++    case SPF_UNKNOWN:
++      if (spfbehavior < 6) break;
++    case SPF_NEUTRAL:
++      if (spfbehavior < 5) break;
++    case SPF_SOFTFAIL:
++      if (spfbehavior < 4) break;
++    case SPF_FAIL:
++      if (spfbehavior < 3) break;
++      if (!spfexplanation(&spfbarfmsg)) die_nomem();
++      if (!stralloc_0(&spfbarfmsg)) die_nomem();
++      flagbarfspf = 1;
++    }
++   } 
++  else
++   env_unset("SPFRESULT");
+   seenmail = 1;
+   if (!stralloc_copys(&rcptto,"")) die_nomem();
+   if (!stralloc_copys(&mailfrom,addr.s)) die_nomem();
+   if (!stralloc_0(&mailfrom)) die_nomem();
+   out("250 ok\r\n");
+ }
++
++void err_spf() {
++  int i,j;
++
++  for(i = 0; i < spfbarfmsg.len; i = j + 1) {
++    j = byte_chr(spfbarfmsg.s + i, spfbarfmsg.len - i, '\n') + i;
++    if (j < spfbarfmsg.len) {
++      out("550-");
++      spfbarfmsg.s[j] = 0;
++      out(spfbarfmsg.s);
++      spfbarfmsg.s[j] = '\n';
++      out("\r\n");
++    } else {
++      out("550 ");
++      out(spfbarfmsg.s);
++      out(" (#5.7.1)\r\n");
++    }
++  }
++}
++
+ void smtp_rcpt(arg) char *arg; {
+   if (!seenmail) { err_wantmail(); return; }
+   if (!addrparse(arg)) { err_syntax(); return; }
+   if (flagbarf) { err_bmf(); return; }
++  if (flagbarfspf) { err_spf(); return; }
+   if (relayclient) {
+     --addr.len;
+     if (!stralloc_cats(&addr,relayclient)) die_nomem();
+@@ -351,6 +430,25 @@ int *hops;
+   }
+ }
+  
++void spfreceived()
++{
++  stralloc sa = {0};
++  stralloc rcvd_spf = {0};
++
++  if (!spfbehavior || relayclient) return;
++
++  if (!stralloc_copys(&rcvd_spf, "Received-SPF: ")) die_nomem();
++  if (!spfinfo(&sa)) die_nomem();
++  if (!stralloc_cat(&rcvd_spf, &sa)) die_nomem();
++  if (!stralloc_append(&rcvd_spf, "\n")) die_nomem();
++  if (bytestooverflow) {
++    bytestooverflow -= rcvd_spf.len;
++    if (bytestooverflow <= 0) qmail_fail(&qqt);
++  }
++  qmail_put(&qqt,rcvd_spf.s,rcvd_spf.len);
++}
++
++
+ char accept_buf[FMT_ULONG];
+ void acceptmessage(qp) unsigned long qp;
+ {
+@@ -379,6 +477,7 @@ void smtp_data() {
+   out("354 go ahead\r\n");
+   
+   received(&qqt,"SMTP",local,remoteip,remotehost,remoteinfo,fakehelo);
++  spfreceived();
+   blast(&hops);
+   hops = (hops >= MAXHOPS);
+   if (hops) qmail_fail(&qqt);
+diff -rupN qmail-1.03/qmail-tcpok.c qmail-1.03-IPv6spfptr/qmail-tcpok.c
+--- qmail-1.03/qmail-tcpok.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-tcpok.c 2014-10-15 11:59:44.626618334 +0300
+@@ -5,10 +5,12 @@
+ #include "readwrite.h"
+ #include "auto_qmail.h"
+ #include "exit.h"
++#include "ipalloc.h"
++#include "tcpto.h"
+  
+ #define FATAL "qmail-tcpok: fatal: "
+  
+-char buf[1024]; /* XXX: must match size in tcpto_clean.c, tcpto.c */
++struct tcpto_buf buf[TCPTO_BUFSIZ];
+ substdio ss;
+  
+ void main()
+diff -rupN qmail-1.03/qmail-tcpto.c qmail-1.03-IPv6spfptr/qmail-tcpto.c
+--- qmail-1.03/qmail-tcpto.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/qmail-tcpto.c 2014-10-15 11:59:44.626618334 +0300
+@@ -1,5 +1,7 @@
+ /* XXX: this program knows quite a bit about tcpto's internals */
+  
++#include <sys/types.h>
++#include <sys/socket.h>
+ #include "substdio.h"
+ #include "subfd.h"
+ #include "auto_qmail.h"
+@@ -10,6 +12,8 @@
+ #include "exit.h"
+ #include "datetime.h"
+ #include "now.h"
++#include "ipalloc.h"
++#include "tcpto.h"
+  
+ void die(n) int n; { substdio_flush(subfdout); _exit(n); }
+  
+@@ -28,7 +32,7 @@ void die_open() { warn("fatal: unable to
+ void die_lock() { warn("fatal: unable to lock tcpto"); die(111); }
+ void die_read() { warn("fatal: unable to read tcpto"); die(111); }
+  
+-char tcpto_buf[1024];
++struct tcpto_buf tcpto_buf[TCPTO_BUFSIZ];
+  
+ char tmp[FMT_ULONG + IPFMT];
+  
+@@ -38,8 +42,7 @@ void main()
+  int fd;
+  int r;
+  int i;
+- char *record;
+- struct ip_address ip;
++ int af;
+  datetime_sec when;
+  datetime_sec start;
+  
+@@ -56,29 +59,31 @@ void main()
+  close(fdlock);
+  
+  if (r == -1) die_read();
+- r >>= 4;
++ r /= sizeof(tcpto_buf[0]);
+  
+  start = now();
+  
+- record = tcpto_buf;
+  for (i = 0;i < r;++i)
+   {
+-   if (record[4] >= 1)
++   if (tcpto_buf[i].flag >= 1)
+     {
+-     byte_copy(&ip,4,record);
+-     when = (unsigned long) (unsigned char) record[11];
+-     when = (when << 8) + (unsigned long) (unsigned char) record[10];
+-     when = (when << 8) + (unsigned long) (unsigned char) record[9];
+-     when = (when << 8) + (unsigned long) (unsigned char) record[8];
++     af = tcpto_buf[i].af;
++     when = tcpto_buf[i].when;
+  
+-     substdio_put(subfdout,tmp,ip_fmt(tmp,&ip));
++#ifdef INET6
++     if (af == AF_INET)
++       substdio_put(subfdout,tmp,ip_fmt(tmp,&tcpto_buf[i].addr.ip));
++     else
++       substdio_put(subfdout,tmp,ip6_fmt(tmp,&tcpto_buf[i].addr.ip6));
++#else
++     substdio_put(subfdout,tmp,ip_fmt(tmp,&tcpto_buf[i].addr.ip));
++#endif
+      substdio_puts(subfdout," timed out ");
+      substdio_put(subfdout,tmp,fmt_ulong(tmp,(unsigned long) (start - when)));
+      substdio_puts(subfdout," seconds ago; # recent timeouts: ");
+-     substdio_put(subfdout,tmp,fmt_ulong(tmp,(unsigned long) (unsigned char) record[4]));
++     substdio_put(subfdout,tmp,fmt_ulong(tmp,tcpto_buf[i].flag));
+      substdio_puts(subfdout,"\n");
+     }
+-   record += 16;
+   }
+  
+  die(0);
+diff -rupN qmail-1.03/remoteinfo.c qmail-1.03-IPv6spfptr/remoteinfo.c
+--- qmail-1.03/remoteinfo.c 1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/remoteinfo.c  2014-10-15 11:59:44.626618334 +0300
+@@ -23,33 +23,62 @@ static int myread(fd,buf,len) int fd; ch
+   return timeoutread(t,fd,buf,len);
+ }
+  
+-char *remoteinfo_get(ipr,rp,ipl,lp,timeout)
+-struct ip_address *ipr;
+-unsigned long rp;
+-struct ip_address *ipl;
+-unsigned long lp;
++union sockunion {
++   struct sockaddr     sa;
++   struct sockaddr_in  sa4;
++#ifdef INET6
++   struct sockaddr_in6 sa6;
++#endif
++};
++
++char *remoteinfo_get(saremote, salocal, timeout)
++union sockunion *saremote, *salocal;
+ int timeout;
+ {
+   char *x;
+   int s;
+-  struct sockaddr_in sin;
++  union sockunion sa;
+   substdio ss;
+   char buf[32];
+-  unsigned int len;
++  unsigned int len, rp, lp;
+   int numcolons;
+   char ch;
+  
+   t = timeout;
+   
+-  s = socket(AF_INET,SOCK_STREAM,0);
++  s = socket(saremote->sa.sa_family,SOCK_STREAM,0);
++  if (s == -1) return 0;
++ 
++  switch(saremote->sa.sa_family) {
++  case AF_INET:
++    rp = ntohs(saremote->sa4.sin_port);
++    lp = ntohs(salocal->sa4.sin_port);
++    byte_zero(&sa,sizeof(sa));
++    sa.sa4.sin_family = AF_INET;
++    byte_copy(&sa.sa4.sin_addr, 4, &salocal->sa4.sin_addr);
++    sa.sa4.sin_port = 0;
++    if (bind(s,(struct sockaddr *) &sa.sa,sizeof(sa.sa4)) == -1) { close(s); return 0; }
++    if (timeoutconn(s,&saremote->sa4.sin_addr,113,timeout) == -1) { close(s); return 0; }
++    break;
++#ifdef INET6
++  case AF_INET6:
++    rp = ntohs(saremote->sa6.sin6_port);
++    lp = ntohs(salocal->sa6.sin6_port);
++    s = socket(PF_INET6, SOCK_STREAM, 0);
+   if (s == -1) return 0;
++    byte_zero(&sa,sizeof(sa));
++    sa.sa6.sin6_family = AF_INET6;
++    byte_copy(&sa.sa6.sin6_addr, 16, &salocal->sa6.sin6_addr);
++    sa.sa6.sin6_port = 0;
++    sa.sa6.sin6_flowinfo = 0;
++    if (bind(s,(struct sockaddr *) &sa.sa,sizeof(sa.sa6)) == -1) { close(s); return 0; }
++    if (timeoutconn6(s,&saremote->sa6.sin6_addr,113,timeout) == -1) { close(s); return 0; }
++    break;
++#endif
++  default:
++    return 0;
++  }
+   
+-  byte_zero(&sin,sizeof(sin));
+-  sin.sin_family = AF_INET;
+-  byte_copy(&sin.sin_addr,4,ipl);
+-  sin.sin_port = 0;
+-  if (bind(s,(struct sockaddr *) &sin,sizeof(sin)) == -1) { close(s); return 0; }
+-  if (timeoutconn(s,ipr,113,timeout) == -1) { close(s); return 0; }
+   fcntl(s,F_SETFL,fcntl(s,F_GETFL,0) & ~O_NDELAY);
+   
+   len = 0;
+diff -rupN qmail-1.03/spf.c qmail-1.03-IPv6spfptr/spf.c
+--- qmail-1.03/spf.c    1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/spf.c 2014-10-15 12:05:14.134610481 +0300
+@@ -0,0 +1,1017 @@
++#include <sys/socket.h>
++#include "stralloc.h"
++#include "strsalloc.h"
++#include "alloc.h"
++#include "ip.h"
++#include "ipalloc.h"
++#include "ipme.h"
++#include "str.h"
++#include "fmt.h"
++#include "scan.h"
++#include "byte.h"
++#include "now.h"
++#include "dns.h"
++#include "case.h"
++#include "spf.h"
++#include <stdio.h>
++
++#define SPF_EXT    -1
++#define SPF_SYNTAX -2
++
++#define WSPACE(x) ((x) == ' ' || (x) == '\t' || (x) == '\r' || (x) == '\n')
++#define NXTOK(b, p, a) do { (b) = (p); \
++          while((p) < (a)->len && !WSPACE((a)->s[(p)])) ++(p); \
++          while((p) < (a)->len && WSPACE((a)->s[(p)])) (a)->s[(p)++] = 0; \
++        } while(0)
++
++/* this table and macro came from wget more or less */
++/* and was in turn stolen by me from libspf as is :) */
++const static unsigned char urlchr_table[256] =
++{
++  1,  1,  1,  1,   1,  1,  1,  1,   /* NUL SOH STX ETX  EOT ENQ ACK BEL */
++  1,  1,  1,  1,   1,  1,  1,  1,   /* BS  HT  LF  VT   FF  CR  SO  SI  */
++  1,  1,  1,  1,   1,  1,  1,  1,   /* DLE DC1 DC2 DC3  DC4 NAK SYN ETB */
++  1,  1,  1,  1,   1,  1,  1,  1,   /* CAN EM  SUB ESC  FS  GS  RS  US  */
++  1,  0,  1,  1,   0,  1,  1,  0,   /* SP  !   "   #    $   %   &   '   */
++  0,  0,  0,  1,   0,  0,  0,  1,   /* (   )   *   +    ,   -   .   /   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* 0   1   2   3    4   5   6   7   */
++  0,  0,  1,  1,   1,  1,  1,  1,   /* 8   9   :   ;    <   =   >   ?   */
++  1,  0,  0,  0,   0,  0,  0,  0,   /* @   A   B   C    D   E   F   G   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* H   I   J   K    L   M   N   O   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* P   Q   R   S    T   U   V   W   */
++  0,  0,  0,  1,   1,  1,  1,  0,   /* X   Y   Z   [    \   ]   ^   _   */
++  1,  0,  0,  0,   0,  0,  0,  0,   /* `   a   b   c    d   e   f   g   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* h   i   j   k    l   m   n   o   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* p   q   r   s    t   u   v   w   */
++  0,  0,  0,  1,   1,  1,  1,  1,   /* x   y   z   {    |   }   ~   DEL */
++
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++};
++
++
++extern stralloc addr;
++extern stralloc helohost;
++extern char *remoteip;
++extern char *local;
++
++extern stralloc spflocal;
++extern stralloc spfguess;
++extern stralloc spfexp;
++
++static stralloc sender_fqdn = {0};
++static stralloc explanation = {0};
++static stralloc expdomain = {0};
++static stralloc errormsg = {0};
++static char *received;
++
++static int recursion;
++static struct ip_mx ipmx;
++
++static void hdr_pass() { received = "pass (%{xr}: %{xs} designates %{i} as permitted sender)"; };
++static void hdr_softfail() { received = "softfail (%{xr}: transitioning %{xs} does not designate %{i} as permitted sender)"; };
++static void hdr_fail() { received = "fail (%{xr}: %{xs} does not designate %{i} as permitted sender)"; };
++static void hdr_unknown() { received = "unknown (%{xr}: domain at %{d} does not designate permitted sender hosts)"; };
++static void hdr_neutral() { received = "neutral (%{xr}: %{i} is neither permitted nor denied by %{xs})"; };
++static void hdr_none() { received = "none (%{xr}: domain at %{d} does not designate permitted sender hosts)"; };
++static void hdr_unknown_msg(e) char *e; { stralloc_copys(&errormsg, e); received = "unknown (%{xr}: %{xe})"; };
++static void hdr_ext(e) char *e; { stralloc_copys(&errormsg, e); received = "unknown %{xe} (%{xr}: %{xs} uses mechanism not recognized by this client)"; };
++static void hdr_syntax() { received = "unknown (%{xr}: parse error in %{xs})"; };
++static void hdr_error(e) char *e; { stralloc_copys(&errormsg, e); received = "error (%{xr}: error in processing during lookup of %{d}: %{xe})"; };
++static void hdr_dns() { hdr_error("DNS problem"); }
++
++
++static int matchip(struct ip_address *net, int mask, struct ip_address *ip)
++{
++        int j;
++        int bytemask;
++
++        for (j = 0; j < 4 && mask > 0; ++j) {
++                if (mask > 8) bytemask = 8; else bytemask = mask;
++                mask -= bytemask;
++
++                if ((net->d[j] ^ ip->d[j]) & (0x100 - (1 << (8 - bytemask))))
++                        return 0;
++        }
++        return 1;
++}
++
++#ifdef INET6
++static int matchip6(struct ip6_address *net, int mask, struct ip6_address *ip)
++{
++       int j;
++       int bytemask;
++
++       for (j = 0; j < 16 && mask > 0; ++j) {
++               if (mask > 8) bytemask = 8; else bytemask = mask;
++               mask -= bytemask;
++
++               if ((net->d[j] ^ ip->d[j]) & (0x100 - (1 << (8 - bytemask))))
++                       return 0;
++       }
++       return 1;
++}
++#endif
++
++static int getipmask(char *mask, int ipv6) {
++        unsigned long r;
++        int pos;
++
++        if (!mask) return 32;
++
++        pos = scan_ulong(mask, &r);
++        if (!pos || (mask[pos] && !(mask[pos] == '/' && ipv6))) return -1;
++        if (r > 32) return -1;
++
++        return r;
++}
++
++#ifdef INET6
++static int getip6mask(char *mask, int ipv6) {
++       unsigned long r;
++       int pos;
++
++       if (!mask) return 128;
++
++       pos = scan_ulong(mask, &r);
++       if (!pos || (mask[pos] && !(mask[pos] == '/' && ipv6))) return -1;
++       if (r > 128) return -1;
++
++       return r;
++}
++#endif
++
++int spfget(stralloc *spf, stralloc *domain)
++{
++        strsalloc ssa = {0};
++        int j;
++        int begin, pos, i;
++        int r = SPF_NONE;
++
++        spf->len = 0;
++
++        switch(dns_txt(&ssa, domain)) {
++                case DNS_MEM: return SPF_NOMEM;
++                case DNS_SOFT: hdr_dns(); return SPF_ERROR;
++                case DNS_HARD: return SPF_NONE;
++        }
++
++        for (j = 0;j < ssa.len;++j) {
++                pos = 0;
++
++                NXTOK(begin, pos, &ssa.sa[j]);
++                if (str_len(ssa.sa[j].s + begin) < 6) continue;
++                if (!byte_equal(ssa.sa[j].s + begin,6,"v=spf1")) continue;
++                if (ssa.sa[j].s[begin + 6]) {
++                        /* check for subversion */
++                        if (ssa.sa[j].s[begin + 6] != '.') continue;
++                        for(i = begin + 7;;++i)
++                                if (!(ssa.sa[j].s[i] >= '0' && ssa.sa[j].s[i] <= '9')) break;
++                        if (i == (begin + 7)) continue;
++                        if (ssa.sa[j].s[i]) continue;
++                }
++
++                if (spf->len > 0) {
++                        spf->len = 0;
++                        hdr_unknown_msg("Multiple SPF records returned");
++                        r = SPF_UNKNOWN;
++                        break;
++                }
++                if (!stralloc_0(&ssa.sa[j])) return SPF_NOMEM;
++                if (!stralloc_copys(spf,ssa.sa[j].s + pos)) return SPF_NOMEM;
++                r = SPF_OK;
++        }
++
++        for (j = 0;j < ssa.len;++j)
++                alloc_free(ssa.sa[j].s);
++        alloc_free(ssa.sa);
++        return r;
++}
++
++static int spf_ptr(char *spec, char *mask);
++
++int spfsubst(stralloc *expand, char *spec, char *domain)
++{
++        static char hexdigits[] = "0123456789abcdef";
++        stralloc sa = {0};
++        char ch;
++        int digits = -1;
++        int urlencode = 0;
++        int reverse = 0;
++        int start = expand->len;
++        int i, pos;
++        char *split = ".";
++
++        if (!stralloc_readyplus(&sa,0)) return 0;
++
++        if (*spec == 'x') { i = 1; ++spec; } else i = 0;
++        ch = *spec++;
++        if (!ch) { alloc_free(sa.s); return 1; }
++        if (ch >= 'A' && ch <= 'Z') { ch += 32; urlencode = 1; }
++        if (i) ch -= 32;
++        while(*spec >= '0' && *spec <= '9') {
++                if (digits < 0) digits = 0;
++                if (digits >= 1000000) { digits = 10000000; continue; }
++                digits = (digits * 10) + (*spec - '0');
++                spec++;
++        }
++
++        while((*spec >= 'a' && *spec <= 'z') || (*spec >= 'A' && *spec <= 'Z')) {
++                if (*spec == 'r') reverse = 1;
++                spec++;
++        }
++
++        if (*spec) split = spec;
++
++        switch(ch) {
++                case 'l':
++                        pos = byte_rchr(addr.s, addr.len, '@');
++                        if (pos < addr.len) {
++                                if (!stralloc_copyb(&sa, addr.s, pos)) return 0;
++                        } else
++                                if (!stralloc_copys(&sa, "postmaster")) return 0;
++                        break;
++                case 's':
++                        if (!stralloc_copys(&sa, addr.s)) return 0;
++                        break;
++                case 'o':
++                        pos = byte_rchr(addr.s, addr.len, '@') + 1;
++                        if (pos > addr.len) break;
++                        if (!stralloc_copys(&sa, addr.s + pos)) return 0;
++                        break;
++                case 'd':
++                        if (!stralloc_copys(&sa, domain)) return 0;
++                        break;
++                case 'i':
++                        if (!stralloc_ready(&sa, IPFMT)) return 0;
++#ifdef INET6
++                        if(ipmx.af==AF_INET6)
++                                sa.len = ip6_fmt(sa.s, &ipmx.addr.ip6);
++                        else
++#endif
++                          sa.len = ip_fmt(sa.s, &ipmx.addr.ip);
++     
++                        break;
++                case 't':
++                        if (!stralloc_ready(&sa, FMT_ULONG)) return 0;
++                        sa.len = fmt_ulong(sa.s, (unsigned long)now());
++                        break;
++                case 'p':
++                        if (!sender_fqdn.len)
++                                spf_ptr(domain, 0);
++                        if (sender_fqdn.len) {
++                                if (!stralloc_copy(&sa, &sender_fqdn)) return 0;
++                        } else
++                                if (!stralloc_copys(&sa, "unknown")) return 0;
++                        break;
++                case 'v': 
++                        if (!stralloc_copys(&sa, "in-addr")) return 0;
++                        break;
++                case 'h':
++                        if (!stralloc_copys(&sa, helohost.s)) return 0; /* FIXME: FQDN? */
++                        break;
++                case 'E':
++                        if (errormsg.len && !stralloc_copy(&sa, &errormsg)) return 0;
++                        break;
++                case 'R':
++                        if (!stralloc_copys(&sa, local)) return 0;
++                        break;
++                case 'S':
++                        if (expdomain.len > 0) {
++                                if (!stralloc_copys(&sa, "SPF record at ")) return 0;
++                                if (!stralloc_cats(&sa, expdomain.s)) return 0;
++                        } else {
++                                if (!stralloc_copys(&sa, "local policy")) return 0;
++                        }
++                        break;
++        }
++
++        if (reverse) {
++                for(pos = 0; digits; ++pos) {
++                        pos += byte_cspn(sa.s + pos, sa.len - pos, split);
++                        if (pos >= sa.len) break;
++                        if (!--digits) break;
++                }
++
++                for(; pos > 0; pos = i - 1) {
++                        i = byte_rcspn(sa.s, pos, split) + 1;
++                        if (i > pos) i = 0;
++                        if (!stralloc_catb(expand, sa.s + i, pos - i)) return 0;
++                        if (i > 0 && !stralloc_append(expand, ".")) return 0;
++                }
++        } else {
++                for(pos = sa.len; digits; --pos) {
++                        i = byte_rcspn(sa.s, pos, split) + 1;
++                        if (i > pos) { pos = 0; break; }
++                        pos = i;
++                        if (!--digits) break;
++                }
++
++                if (!stralloc_catb(expand, sa.s + pos, sa.len - pos)) return 0;
++                if (split[0] != '.' || split[1])
++                        for(pos = 0; pos < expand->len; pos++) {
++                                pos += byte_cspn(expand->s + pos, expand->len - pos, split);
++                                if (pos < expand->len)
++                                        expand->s[pos] = '.';
++                        }
++        }
++
++        if (urlencode) {
++                stralloc_copyb(&sa, expand->s + start, expand->len - start);
++                expand->len = start;
++
++                for(pos = 0; pos < sa.len; ++pos) {
++                        ch = sa.s[pos];
++                        if (urlchr_table[(unsigned char)ch]) {
++                                if (!stralloc_readyplus(expand, 3)) return 0;
++                                expand->s[expand->len++] = '%';
++                                expand->s[expand->len++] = hexdigits[(unsigned char)ch >> 4];
++                                expand->s[expand->len++] = hexdigits[(unsigned char)ch & 15];
++                        } else
++                                if (!stralloc_append(expand, &ch)) return 0;
++                }
++        }
++
++        alloc_free(sa.s);
++        return 1;
++}
++
++int spfexpand(stralloc *sa, char *spec, char *domain)
++{
++        char *p;
++        char append;
++        int pos;
++
++        if (!stralloc_readyplus(sa, 0)) return 0;
++        sa->len = 0;
++
++        for(p = spec; *p; p++) {
++                append = *p;
++                if (*p == '%') {
++                        p++;
++                        switch(*p) {
++                                case '%': break;
++                                case '_': append = ' '; break;
++                                case '-': if (!stralloc_cats(sa, "%20")) return 0; continue;
++                                case '{':
++                                        pos = str_chr(p, '}');
++                                        if (p[pos] != '}') { p--; break; }
++                                        p[pos] = 0;
++                                        if (!spfsubst(sa, p + 1, domain)) return 0;
++                                        p += pos;
++                                        continue;
++                                default: p--;
++                        }
++                }
++                if (!stralloc_append(sa, &append)) return 0;
++        }
++
++        return 1;
++}
++
++static int spflookup(stralloc *domain);
++
++static int spf_include(char *spec, char *mask)
++{
++        stralloc sa = {0};
++        int r;
++
++        if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++       
++        r = spflookup(&sa);
++        alloc_free(sa.s);
++
++        switch(r) {
++                case SPF_NONE:
++                        hdr_unknown();
++                        r = SPF_UNKNOWN;
++                        break;
++                case SPF_SYNTAX:
++                        r = SPF_UNKNOWN;
++                        break;
++                case SPF_NEUTRAL:
++                case SPF_SOFTFAIL:
++                case SPF_FAIL:
++                        r = SPF_NONE;
++                        break;
++        }
++
++        return r;
++}
++
++static int spf_a(char *spec, char *mask)
++{
++        stralloc sa = {0};
++        ipalloc ia = {0};
++#ifdef INET6
++   int ipmask = ipmx.af==AF_INET6 ? getip6mask(mask, 1) : getipmask(mask, 1);
++#else
++        int ipmask = getipmask(mask, 1);
++#endif
++        int r;
++        int j;
++
++        if (ipmask < 0) return SPF_SYNTAX;
++
++        if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++        if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++
++        switch(dns_ip(&ia, &sa)) {
++                case DNS_MEM: return SPF_NOMEM;
++                case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                case DNS_HARD: r = SPF_NONE; break;
++                default:
++                        r = SPF_NONE;
++                        for(j = 0; j < ia.len; ++j)
++            if((ipmx.af==AF_INET && matchip(&ia.ix[j].addr.ip, ipmask, &ipmx.addr.ip))
++#ifdef INET6
++               ||
++               (ipmx.af==AF_INET6 && matchip6(&ia.ix[j].addr.ip6, ipmask, &ipmx.addr.ip6))
++#endif
++            ) {
++
++                                        r = SPF_OK;
++                                        break;
++                                }
++        }
++
++        alloc_free(sa.s);
++        alloc_free(ia.ix);
++        return r;
++}
++
++static int spf_mx(char *spec, char *mask)
++{
++        stralloc sa = {0};
++        ipalloc ia = {0};
++        int ipmask = getipmask(mask, 1);
++        int random = now() + (getpid() << 16);
++        int r;
++        int j;
++
++        if (ipmask < 0) return SPF_SYNTAX;
++
++        if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++        if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++
++        switch(dns_mxip(&ia, &sa, random)) {
++                case DNS_MEM: return SPF_NOMEM;
++                case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                case DNS_HARD: r = SPF_NONE; break;
++                default:
++                        r = SPF_NONE;
++                        for(j = 0; j < ia.len; ++j)
++            if((ipmx.af==AF_INET && matchip(&ia.ix[j].addr.ip, ipmask, &ipmx.addr.ip))
++#ifdef INET6
++               ||
++               (ipmx.af==AF_INET6 && matchip6(&ia.ix[j].addr.ip6, ipmask, &ipmx.addr.ip6))
++#endif
++            ) {
++                                        r = SPF_OK;
++                                        break;
++                                }
++        }
++
++        alloc_free(sa.s);
++        alloc_free(ia.ix);
++        return r;
++}
++
++static int spf_ptr(char *spec, char *mask)
++{
++       int len = str_len(spec);
++       int r;
++       int j, k;
++       int pos;      
++       
++       /* we didn't find host with the matching ip before */
++       if (sender_fqdn.len == 7 && str_equal(sender_fqdn.s, "unknown"))
++               return SPF_NONE;
++
++       /* the hostname found will probably be the same as before */
++       while (sender_fqdn.len) {
++               pos = sender_fqdn.len - len;
++               if (pos < 0) break;
++               if (pos > 0 && sender_fqdn.s[pos - 1] != '.') break;
++               if (case_diffb(sender_fqdn.s + pos, len, spec)) break;
++
++               return SPF_OK;
++       }
++      
++       if (ipmx.af == AF_INET) {
++          
++               strsalloc ssa = {0};
++               ipalloc ia = {0};
++               int len = str_len(spec);
++               int r;
++               int j, k;
++               int pos;
++
++       
++               /* ok, either it's the first test or it's a very weird setup */
++
++               if (!stralloc_readyplus(&ssa, 0)) return SPF_NOMEM;
++               if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++        
++              switch(dns_ptr(&ssa, &ipmx.addr.ip)) {
++                       case DNS_MEM: return SPF_NOMEM;
++                       case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                       case DNS_HARD: r = SPF_NONE; break;
++                       default:
++                               r = SPF_NONE;
++                               for(j = 0; j < ssa.len; ++j) {
++                                       switch(dns_ip(&ia, &ssa.sa[j])) {
++                                               case DNS_MEM: return SPF_NOMEM;
++                                               case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                                               case DNS_HARD: break;
++                                               default:
++                                                           for(k = 0; k < ia.len; ++k)
++                                                               if((ipmx.af==AF_INET && matchip(&ia.ix[k].addr.ip, 32, &ipmx.addr.ip))) {
++                    
++                                                                       if (!sender_fqdn.len)
++                                                                               if (!stralloc_copy(&sender_fqdn, &ssa.sa[j])) return SPF_NOMEM;
++
++                                                                       pos = ssa.sa[j].len - len;
++                                                                       if (pos < 0) continue;
++                                                                       if (pos > 0 && ssa.sa[j].s[pos - 1] != '.') continue;
++                                                                       if (case_diffb(ssa.sa[j].s + pos, len, spec)) continue;
++
++                                                                       stralloc_copy(&sender_fqdn, &ssa.sa[j]);
++                                                                       r = SPF_OK;
++                                                                       break;
++                                                                }
++                                       }
++
++                                       if (r == SPF_ERROR) break;
++                               }
++               }
++           for(j = 0;j < ssa.len;++j)
++                   alloc_free(ssa.sa[j].s);
++
++           alloc_free(ssa.sa);
++           alloc_free(ia.ix);
++           
++           if (!sender_fqdn.len)
++                   if (!stralloc_copys(&sender_fqdn, "unknown")) return SPF_NOMEM;
++
++           return r;                      
++      }
++      
++      else if (ipmx.af == AF_INET6) {
++            
++               stralloc sa = {0};
++               ipalloc ia = {0};
++       
++               if (!stralloc_readyplus(&sa, 0)) return SPF_NOMEM;
++               if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++               
++               switch(dns_ptr6(&sa, &ipmx.addr.ip6)) {
++                       case DNS_MEM: return SPF_NOMEM;
++                       case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                       case DNS_HARD: r = SPF_NONE; break;
++                       default:
++                               r = SPF_NONE;
++                                       switch(dns_ip(&ia, &sa)) {
++                                               case DNS_MEM: return SPF_NOMEM;
++                                               case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                                               case DNS_HARD: break;
++                                               default:
++                                               if(ipmx.af==AF_INET6 && matchip6(&ia.ix[0].addr.ip6, 128, &ipmx.addr.ip6)) {
++                                                       if (!sender_fqdn.len)
++                                                               if (!stralloc_copy(&sender_fqdn, &sa)) return SPF_NOMEM;
++                                                       stralloc_copy(&sender_fqdn, &sa.s);
++                                                       r = SPF_OK;
++                                                       break;
++                                               }
++                                       }
++
++                                       if (r == SPF_ERROR) break;
++               }
++           alloc_free(sa.s);
++           alloc_free(ia.ix);
++           return r;              
++      }
++}
++
++static int spf_ip(char *spec, char *mask)
++{
++        struct ip_address net;
++        int ipmask = getipmask(mask, 0);
++
++        if (ipmask < 0) return SPF_SYNTAX;
++        if (!ip_scan(spec, &net)) return SPF_SYNTAX;
++       if (matchip(&net, ipmask, &ipmx.addr.ip)) return SPF_OK;
++
++       return SPF_NONE;
++}
++
++#ifdef INET6
++static int spf_ip6(char *spec, char *mask)
++{
++       struct ip6_address net;
++       int ipmask = getip6mask(mask, 0);
++
++       if (ipmask < 0) return SPF_SYNTAX;
++       if (!ip6_scan(spec, &net)) return SPF_SYNTAX;
++
++       if (matchip6(&net, ipmask, &ipmx.addr.ip6)) return SPF_OK;
++
++        return SPF_NONE;
++}
++#endif
++
++
++static int spf_exists(char *spec, char *mask)
++{
++        stralloc sa = {0};
++        ipalloc ia = {0};
++        int r;
++
++        if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++        if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++
++        switch(dns_ip(&ia, &sa)) {
++                case DNS_MEM: return SPF_NOMEM;
++                case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++                case DNS_HARD: r = SPF_NONE; break;
++                default: r = SPF_OK;
++        }
++
++        alloc_free(sa.s);
++        alloc_free(ia.ix);
++        return r;
++}
++
++static struct mechanisms {
++  char *mechanism;
++  int (*func)(char *spec, char *mask);
++  unsigned int takes_spec  : 1;
++  unsigned int takes_mask  : 1;
++  unsigned int expands     : 1;
++  unsigned int filldomain  : 1;
++  int defresult            : 4;
++} mechanisms[] = {
++  { "all",      0,          0,0,0,0,SPF_OK   }
++, { "include",  spf_include,1,0,1,0,0        }
++, { "a",        spf_a,      1,1,1,1,0        }
++, { "mx",       spf_mx,     1,1,1,1,0        }
++, { "ptr",      spf_ptr,    1,0,1,1,0        }
++, { "ip4",      spf_ip,     1,1,0,0,0        }
++#ifdef INET6
++, { "ip6",      spf_ip6,    1,1,0,0,0        }
++#else
++, { "ip6",      0,          1,1,0,0,SPF_NONE }
++#endif
++, { "exists",   spf_exists, 1,0,1,0,0        }
++, { "extension",0,          1,1,0,0,SPF_EXT  }
++, { 0,          0,          1,1,0,0,SPF_EXT  }
++};
++
++static int spfmech(char *mechanism, char *spec, char *mask, char *domain)
++{
++        struct mechanisms *mech;
++        stralloc sa = {0};
++        int r;
++        int pos;
++
++        for(mech = mechanisms; mech->mechanism; mech++)
++                if (str_equal(mech->mechanism, mechanism)) break;
++
++        if (mech->takes_spec && !spec && mech->filldomain) spec = domain;
++        if (!mech->takes_spec != !spec) return SPF_SYNTAX;
++        if (!mech->takes_mask && mask) return SPF_SYNTAX;
++        if (!mech->func) return mech->defresult;
++
++        if (!stralloc_readyplus(&sa, 0)) return SPF_NOMEM;
++        if (mech->expands && spec != domain) {
++                if (!spfexpand(&sa, spec, domain)) return SPF_NOMEM;
++                for (pos = 0; (sa.len - pos) > 255;) {
++                        pos += byte_chr(sa.s + pos, sa.len - pos, '.');
++                        if (pos < sa.len) pos++;
++                }
++                sa.len -= pos;
++                if (pos > 0) byte_copy(sa.s, sa.len, sa.s + pos);
++                stralloc_0(&sa);
++                spec = sa.s;
++        }
++
++        r = mech->func(spec, mask);
++        alloc_free(sa.s);
++        return r;
++}
++
++static struct default_aliases {
++  char *alias;
++  int defret;
++} default_aliases[] = {
++  { "allow",   SPF_OK }
++, { "pass",    SPF_OK }
++, { "deny",    SPF_FAIL }
++, { "softdeny",SPF_SOFTFAIL }
++, { "fail",    SPF_FAIL }
++, { "softfail",SPF_SOFTFAIL }
++, { "unknown", SPF_NEUTRAL }
++, { 0,         SPF_UNKNOWN }
++};
++
++static int spflookup(stralloc *domain)
++{
++        stralloc spf = {0};
++        stralloc sa = {0};
++        struct default_aliases *da;
++        int main = !recursion;
++        int local_pos = -1;
++        int r, q;
++        int begin, pos;
++        int i;
++        int prefix;
++        int done;
++        int guessing = 0;
++        char *p;
++
++        if (!stralloc_readyplus(&spf, 0)) return SPF_NOMEM;
++        if (!stralloc_readyplus(&sa, 0)) return SPF_NOMEM;
++
++        /* fallthrough result */
++        if (main) hdr_none();
++
++redirect:
++        if (++recursion > 20) {
++                alloc_free(spf.s);
++                alloc_free(sa.s);
++                hdr_unknown_msg("Maximum nesting level exceeded, possible loop");
++                return SPF_SYNTAX;
++        }
++   
++        if (!stralloc_0(domain)) return SPF_NOMEM;
++        if (!stralloc_copy(&expdomain, domain)) return SPF_NOMEM;
++
++
++        r = spfget(&spf, domain);
++        
++        if (r == SPF_NONE) {
++                if (!main) { alloc_free(spf.s); return r; }
++
++                if (spfguess.len) {
++                        /* try to guess */
++                        guessing = 1;
++                        if (!stralloc_copys(&spf, spfguess.s)) return SPF_NOMEM;
++                        if (!stralloc_append(&spf, " ")) return SPF_NOMEM;
++                } else
++                        spf.len = 0;
++
++                /* append local rulest */
++                if (spflocal.len) {
++                        local_pos = spf.len;
++                        if (!stralloc_cats(&spf, spflocal.s)) return SPF_NOMEM;
++                }
++                if (!stralloc_0(&spf)) return SPF_NOMEM;
++
++                expdomain.len = 0;
++        } else if (r == SPF_OK) {
++                if (!stralloc_0(&spf)) return SPF_NOMEM;
++                if (main) hdr_neutral();
++                r = SPF_NEUTRAL;
++
++                /* try to add local rules before fail all mechs */
++                if (main && spflocal.len) {
++                        pos = 0;
++                        p = (char *) 0;
++                        while(pos < spf.len) {
++                                NXTOK(begin, pos, &spf);
++                                if (!spf.s[begin]) continue;
++
++                                if (p && spf.s[begin] != *p) p = (char *) 0;
++                                if (!p && (spf.s[begin] == '-' || spf.s[begin] == '~' ||
++                                           spf.s[begin] == '?')) p = &spf.s[begin];
++
++                                if (p && p > spf.s && str_equal(spf.s + begin + 1, "all")) {
++                                        /* ok, we can insert the local rules at p */
++                                        local_pos = p - spf.s;
++
++                                        stralloc_readyplus(&spf, spflocal.len);
++                                        p = spf.s + local_pos;
++                                        byte_copyr(p + spflocal.len, spf.len - local_pos, p);
++                                        byte_copy(p, spflocal.len, spflocal.s);
++                                        spf.len += spflocal.len;
++
++                                        pos += spflocal.len;
++                                        break;
++                                }
++                        }
++
++                        if (pos >= spf.len) pos = spf.len - 1;
++                        for(i = 0; i < pos; i++)
++                                if (!spf.s[i]) spf.s[i] = ' ';
++                }
++        } else {
++                alloc_free(spf.s);
++                return r;
++        }
++
++        pos = 0;
++        done = 0;
++        while(pos < spf.len) {
++                NXTOK(begin, pos, &spf);
++                if (!spf.s[begin]) continue;
++
++                /* in local ruleset? */
++                if (!done && local_pos >= 0 && begin >= local_pos) {
++                        if (begin < (local_pos + spflocal.len))
++                                expdomain.len = 0;
++                        else
++                                if (!stralloc_copy(&expdomain, domain))
++                                        return SPF_NOMEM;
++                }
++
++                for (p = spf.s + begin;*p;++p)
++                        if (*p == ':' || *p == '/' || *p == '=') break;
++
++                if (*p == '=') {
++                        *p++ = 0;
++
++                        /* modifiers are simply handled here */
++                        if (str_equal(spf.s + begin, "redirect")) {
++                                if (done) continue;
++
++                                if (!spfexpand(&sa, p, domain->s)) return SPF_NOMEM;
++                                stralloc_copy(domain, &sa);
++
++                                hdr_unknown();
++                                r = SPF_UNKNOWN;
++
++                                goto redirect;
++                        } else if (str_equal(spf.s + begin, "default")) {
++                                if (done) continue;
++
++                                for(da = default_aliases; da->alias; ++da)
++                                        if (str_equal(da->alias, p)) break;
++
++                                r = da->defret;
++                        } else if (str_equal(spf.s + begin, "exp")) {
++                                strsalloc ssa = {0};
++
++                                if (!main) continue;
++
++                                if (!stralloc_copys(&sa, p)) return SPF_NOMEM;
++                                switch(dns_txt(&ssa, &sa)) {
++                                        case DNS_MEM: return SPF_NOMEM;
++                                        case DNS_SOFT: continue; /* FIXME... */
++                                        case DNS_HARD: continue;
++                                }
++
++                                explanation.len = 0;
++                                for(i = 0; i < ssa.len; i++) {
++                                        if (!stralloc_cat(&explanation, &ssa.sa[i])) return SPF_NOMEM;
++                                        if (i < (ssa.len - 1))
++                                                if (!stralloc_append(&explanation, "\n")) return SPF_NOMEM;
++
++                                        alloc_free(ssa.sa[i].s);
++                                }
++                                if (!stralloc_0(&explanation)) return SPF_NOMEM;
++                        } /* and unknown modifiers are ignored */
++                } else if (!done) {
++                        if (!stralloc_copys(&sa, spf.s + begin)) return SPF_NOMEM;
++                        if (!stralloc_0(&sa)) return SPF_NOMEM;
++
++                        switch(spf.s[begin]) {
++                                case '-': begin++; prefix = SPF_FAIL; break;
++                                case '~': begin++; prefix = SPF_SOFTFAIL; break;
++                                case '+': begin++; prefix = SPF_OK; break;
++                                case '?': begin++; prefix = SPF_NEUTRAL; break;
++                                default: prefix = SPF_OK;
++                        }
++
++                        if (*p == '/') {
++                                *p++ = 0;
++                                q = spfmech(spf.s + begin, 0, p, domain->s);
++                        } else {
++                                if (*p) *p++ = 0;
++                                i = str_chr(p, '/');
++                                if (p[i] == '/') {
++                                        p[i++] = 0;
++                                        q = spfmech(spf.s + begin, p, p + i, domain->s);
++                                } else if (i > 0)                                
++                                        q = spfmech(spf.s + begin, p, 0, domain->s);                                
++                                else 
++                                        q = spfmech(spf.s + begin, 0, 0, domain->s);
++                                   
++                        }
++
++                        if (q == SPF_OK) q = prefix;                     
++                        switch(q) {
++                                case SPF_OK: hdr_pass(); break;
++                                case SPF_NEUTRAL: hdr_neutral(); break;
++                                case SPF_SYNTAX: hdr_syntax(); break;
++                                case SPF_SOFTFAIL: hdr_softfail(); break;
++                                case SPF_FAIL: hdr_fail(); break;
++                                case SPF_EXT: hdr_ext(sa.s); break;
++                                case SPF_ERROR:
++                                        if (!guessing)
++                                                break;
++                                        if (local_pos >= 0 && begin >= local_pos)
++                                                break;
++                                        hdr_none();
++                                        q = SPF_NONE;
++                                        break;
++                                case SPF_NONE: continue;
++                        }
++
++                        r = q;
++                        done = 1; /* we're done, no more mechanisms */
++                }
++        }
++
++        /* we fell through, no local rule applied */
++        if (!done && !stralloc_copy(&expdomain, domain)) return SPF_NOMEM;
++
++        alloc_free(spf.s);
++        alloc_free(sa.s);
++
++        return r;
++}
++
++int spfcheck()
++{
++        stralloc domain = {0};
++        int pos;
++        int r;
++
++        pos = byte_rchr(addr.s, addr.len, '@') + 1;
++        if (pos < addr.len) {
++                if (!stralloc_copys(&domain, addr.s + pos)) return SPF_NOMEM;
++        } else {
++                pos = str_rchr(helohost.s, '@');
++                if (helohost.s[pos]) {
++                        if (!stralloc_copys(&domain, helohost.s + pos + 1)) return SPF_NOMEM;
++                } else
++                        if (!stralloc_copys(&domain, helohost.s)) return SPF_NOMEM;
++        }
++        if (!stralloc_copys(&explanation, spfexp.s)) return SPF_NOMEM;
++        if (!stralloc_0(&explanation)) return SPF_NOMEM;
++        recursion = 0;
++
++   if (remoteip) {
++      if(ip_scan(remoteip, &ipmx.addr.ip))
++         ipmx.af = AF_INET;
++#ifdef INET6
++      else if(ip6_scan(remoteip, &ipmx.addr.ip6))
++         ipmx.af = AF_INET6;
++#endif
++      else
++         ipmx.af = AF_UNSPEC;
++   }
++
++   if(!remoteip || ipmx.af == AF_UNSPEC) {
++                hdr_unknown_msg("No IP address in conversation");
++                return SPF_UNKNOWN;
++        }
++
++        if (!stralloc_readyplus(&expdomain, 0)) return SPF_NOMEM;
++        if (!stralloc_readyplus(&errormsg, 0)) return SPF_NOMEM;
++        expdomain.len = 0;
++        errormsg.len = 0;
++        sender_fqdn.len = 0;
++        received = (char *) 0;
++
++       if (
++      (ipmx.af==AF_INET && ((ipmx.addr.ip.d[0] == 127 && ipmx.addr.ip.d[1] == 0 && ipmx.addr.ip.d[2] == 0 && ipmx.addr.ip.d[3] == 1) || ipme_is(&ipmx.addr.ip)))
++#ifdef INET6
++      ||
++      (ipmx.af==AF_INET6 && ipme_is6(&ipmx.addr.ip6))
++#endif
++   )
++                { hdr_pass(); r = SPF_OK; }
++        else
++                r = spflookup(&domain);
++
++        if (r < 0) r = SPF_UNKNOWN;
++
++        alloc_free(domain.s);
++        return r;
++}
++
++int spfexplanation(sa)
++stralloc *sa;
++{
++        return spfexpand(sa, explanation.s, expdomain.s);
++}
++
++int spfinfo(sa)
++stralloc *sa;
++{
++        stralloc tmp = {0};
++        if (!stralloc_copys(&tmp, received)) return 0;
++        if (!stralloc_0(&tmp)) return 0;
++        if (!spfexpand(sa, tmp.s, expdomain.s)) return 0;
++        alloc_free(tmp.s);
++        return 1;
++}
++
+diff -rupN qmail-1.03/spf.c~ qmail-1.03-IPv6spfptr/spf.c~
+--- qmail-1.03/spf.c~   1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/spf.c~    2014-10-15 11:59:36.890618519 +0300
+@@ -0,0 +1,878 @@
++#include "stralloc.h"
++#include "strsalloc.h"
++#include "alloc.h"
++#include "ip.h"
++#include "ipalloc.h"
++#include "ipme.h"
++#include "str.h"
++#include "fmt.h"
++#include "scan.h"
++#include "byte.h"
++#include "now.h"
++#include "dns.h"
++#include "case.h"
++#include "spf.h"
++
++#define SPF_EXT    -1
++#define SPF_SYNTAX -2
++
++#define WSPACE(x) ((x) == ' ' || (x) == '\t' || (x) == '\r' || (x) == '\n')
++#define NXTOK(b, p, a) do { (b) = (p); \
++          while((p) < (a)->len && !WSPACE((a)->s[(p)])) ++(p); \
++          while((p) < (a)->len && WSPACE((a)->s[(p)])) (a)->s[(p)++] = 0; \
++        } while(0)
++
++/* this table and macro came from wget more or less */
++/* and was in turn stolen by me from libspf as is :) */
++const static unsigned char urlchr_table[256] =
++{
++  1,  1,  1,  1,   1,  1,  1,  1,   /* NUL SOH STX ETX  EOT ENQ ACK BEL */
++  1,  1,  1,  1,   1,  1,  1,  1,   /* BS  HT  LF  VT   FF  CR  SO  SI  */
++  1,  1,  1,  1,   1,  1,  1,  1,   /* DLE DC1 DC2 DC3  DC4 NAK SYN ETB */
++  1,  1,  1,  1,   1,  1,  1,  1,   /* CAN EM  SUB ESC  FS  GS  RS  US  */
++  1,  0,  1,  1,   0,  1,  1,  0,   /* SP  !   "   #    $   %   &   '   */
++  0,  0,  0,  1,   0,  0,  0,  1,   /* (   )   *   +    ,   -   .   /   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* 0   1   2   3    4   5   6   7   */
++  0,  0,  1,  1,   1,  1,  1,  1,   /* 8   9   :   ;    <   =   >   ?   */
++  1,  0,  0,  0,   0,  0,  0,  0,   /* @   A   B   C    D   E   F   G   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* H   I   J   K    L   M   N   O   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* P   Q   R   S    T   U   V   W   */
++  0,  0,  0,  1,   1,  1,  1,  0,   /* X   Y   Z   [    \   ]   ^   _   */
++  1,  0,  0,  0,   0,  0,  0,  0,   /* `   a   b   c    d   e   f   g   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* h   i   j   k    l   m   n   o   */
++  0,  0,  0,  0,   0,  0,  0,  0,   /* p   q   r   s    t   u   v   w   */
++  0,  0,  0,  1,   1,  1,  1,  1,   /* x   y   z   {    |   }   ~   DEL */
++
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++  1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,   1,  1,  1,  1,
++};
++
++
++extern stralloc addr;
++extern stralloc helohost;
++extern char *remoteip;
++extern char *local;
++
++extern stralloc spflocal;
++extern stralloc spfguess;
++extern stralloc spfexp;
++
++static stralloc sender_fqdn = {0};
++static stralloc explanation = {0};
++static stralloc expdomain = {0};
++static stralloc errormsg = {0};
++static char *received;
++
++static int recursion;
++static struct ip_address ip;
++
++static void hdr_pass() { received = "pass (%{xr}: %{xs} designates %{i} as permitted sender)"; };
++static void hdr_softfail() { received = "softfail (%{xr}: transitioning %{xs} does not designate %{i} as permitted sender)"; };
++static void hdr_fail() { received = "fail (%{xr}: %{xs} does not designate %{i} as permitted sender)"; };
++static void hdr_unknown() { received = "unknown (%{xr}: domain at %{d} does not designate permitted sender hosts)"; };
++static void hdr_neutral() { received = "neutral (%{xr}: %{i} is neither permitted nor denied by %{xs})"; };
++static void hdr_none() { received = "none (%{xr}: domain at %{d} does not designate permitted sender hosts)"; };
++static void hdr_unknown_msg(e) char *e; { stralloc_copys(&errormsg, e); received = "unknown (%{xr}: %{xe})"; };
++static void hdr_ext(e) char *e; { stralloc_copys(&errormsg, e); received = "unknown %{xe} (%{xr}: %{xs} uses mechanism not recognized by this client)"; };
++static void hdr_syntax() { received = "unknown (%{xr}: parse error in %{xs})"; };
++static void hdr_error(e) char *e; { stralloc_copys(&errormsg, e); received = "error (%{xr}: error in processing during lookup of %{d}: %{xe})"; };
++static void hdr_dns() { hdr_error("DNS problem"); }
++
++
++static int matchip(struct ip_address *net, int mask, struct ip_address *ip)
++{
++   int j;
++   int bytemask;
++
++   for (j = 0; j < 4 && mask > 0; ++j) {
++       if (mask > 8) bytemask = 8; else bytemask = mask;
++       mask -= bytemask;
++
++       if ((net->d[j] ^ ip->d[j]) & (0x100 - (1 << (8 - bytemask))))
++           return 0;
++   }
++   return 1;
++}
++
++static int getipmask(char *mask, int ipv6) {
++   unsigned long r;
++   int pos;
++
++   if (!mask) return 32;
++
++   pos = scan_ulong(mask, &r);
++   if (!pos || (mask[pos] && !(mask[pos] == '/' && ipv6))) return -1;
++   if (r > 32) return -1;
++
++   return r;
++}
++
++int spfget(stralloc *spf, stralloc *domain)
++{
++   strsalloc ssa = {0};
++   int j;
++   int begin, pos, i;
++   int r = SPF_NONE;
++
++   spf->len = 0;
++
++   switch(dns_txt(&ssa, domain)) {
++       case DNS_MEM: return SPF_NOMEM;
++       case DNS_SOFT: hdr_dns(); return SPF_ERROR;
++       case DNS_HARD: return SPF_NONE;
++   }
++
++   for (j = 0;j < ssa.len;++j) {
++       pos = 0;
++
++       NXTOK(begin, pos, &ssa.sa[j]);
++       if (str_len(ssa.sa[j].s + begin) < 6) continue;
++       if (!byte_equal(ssa.sa[j].s + begin,6,"v=spf1")) continue;
++       if (ssa.sa[j].s[begin + 6]) {
++           /* check for subversion */
++           if (ssa.sa[j].s[begin + 6] != '.') continue;
++           for(i = begin + 7;;++i)
++               if (!(ssa.sa[j].s[i] >= '0' && ssa.sa[j].s[i] <= '9')) break;
++           if (i == (begin + 7)) continue;
++           if (ssa.sa[j].s[i]) continue;
++       }
++
++       if (spf->len > 0) {
++           spf->len = 0;
++           hdr_unknown_msg("Multiple SPF records returned");
++           r = SPF_UNKNOWN;
++           break;
++       }
++       if (!stralloc_0(&ssa.sa[j])) return SPF_NOMEM;
++       if (!stralloc_copys(spf,ssa.sa[j].s + pos)) return SPF_NOMEM;
++       r = SPF_OK;
++   }
++
++   for (j = 0;j < ssa.len;++j)
++       alloc_free(ssa.sa[j].s);
++   alloc_free(ssa.sa);
++   return r;
++}
++
++static int spf_ptr(char *spec, char *mask);
++
++int spfsubst(stralloc *expand, char *spec, char *domain)
++{
++   static char hexdigits[] = "0123456789abcdef";
++   stralloc sa = {0};
++   char ch;
++   int digits = -1;
++   int urlencode = 0;
++   int reverse = 0;
++   int start = expand->len;
++   int i, pos;
++   char *split = ".";
++
++   if (!stralloc_readyplus(&sa,0)) return 0;
++
++   if (*spec == 'x') { i = 1; ++spec; } else i = 0;
++   ch = *spec++;
++   if (!ch) { alloc_free(sa.s); return 1; }
++   if (ch >= 'A' && ch <= 'Z') { ch += 32; urlencode = 1; }
++   if (i) ch -= 32;
++   while(*spec >= '0' && *spec <= '9') {
++       if (digits < 0) digits = 0;
++       if (digits >= 1000000) { digits = 10000000; continue; }
++       digits = (digits * 10) + (*spec - '0');
++       spec++;
++   }
++
++   while((*spec >= 'a' && *spec <= 'z') || (*spec >= 'A' && *spec <= 'Z')) {
++       if (*spec == 'r') reverse = 1;
++       spec++;
++   }
++
++   if (*spec) split = spec;
++
++   switch(ch) {
++       case 'l':
++           pos = byte_rchr(addr.s, addr.len, '@');
++           if (pos < addr.len) {
++               if (!stralloc_copyb(&sa, addr.s, pos)) return 0;
++           } else
++               if (!stralloc_copys(&sa, "postmaster")) return 0;
++           break;
++       case 's':
++           if (!stralloc_copys(&sa, addr.s)) return 0;
++           break;
++       case 'o':
++           pos = byte_rchr(addr.s, addr.len, '@') + 1;
++           if (pos > addr.len) break;
++           if (!stralloc_copys(&sa, addr.s + pos)) return 0;
++           break;
++       case 'd':
++           if (!stralloc_copys(&sa, domain)) return 0;
++           break;
++       case 'i':
++           if (!stralloc_ready(&sa, IPFMT)) return 0;
++           sa.len = ip_fmt(sa.s, &ip);
++           break;
++       case 't':
++           if (!stralloc_ready(&sa, FMT_ULONG)) return 0;
++           sa.len = fmt_ulong(sa.s, (unsigned long)now());
++           break;
++       case 'p':
++           if (!sender_fqdn.len)
++               spf_ptr(domain, 0);
++           if (sender_fqdn.len) {
++               if (!stralloc_copy(&sa, &sender_fqdn)) return 0;
++           } else
++               if (!stralloc_copys(&sa, "unknown")) return 0;
++           break;
++       case 'v': 
++           if (!stralloc_copys(&sa, "in-addr")) return 0;
++           break;
++       case 'h':
++           if (!stralloc_copys(&sa, helohost.s)) return 0; /* FIXME: FQDN? */
++           break;
++       case 'E':
++           if (errormsg.len && !stralloc_copy(&sa, &errormsg)) return 0;
++           break;
++       case 'R':
++           if (!stralloc_copys(&sa, local)) return 0;
++           break;
++       case 'S':
++           if (expdomain.len > 0) {
++               if (!stralloc_copys(&sa, "SPF record at ")) return 0;
++               if (!stralloc_cats(&sa, expdomain.s)) return 0;
++           } else {
++               if (!stralloc_copys(&sa, "local policy")) return 0;
++           }
++           break;
++   }
++
++   if (reverse) {
++       for(pos = 0; digits; ++pos) {
++           pos += byte_cspn(sa.s + pos, sa.len - pos, split);
++           if (pos >= sa.len) break;
++           if (!--digits) break;
++       }
++
++       for(; pos > 0; pos = i - 1) {
++           i = byte_rcspn(sa.s, pos, split) + 1;
++           if (i > pos) i = 0;
++           if (!stralloc_catb(expand, sa.s + i, pos - i)) return 0;
++           if (i > 0 && !stralloc_append(expand, ".")) return 0;
++       }
++   } else {
++       for(pos = sa.len; digits; --pos) {
++           i = byte_rcspn(sa.s, pos, split) + 1;
++           if (i > pos) { pos = 0; break; }
++           pos = i;
++           if (!--digits) break;
++       }
++
++       if (!stralloc_catb(expand, sa.s + pos, sa.len - pos)) return 0;
++       if (split[0] != '.' || split[1])
++           for(pos = 0; pos < expand->len; pos++) {
++               pos += byte_cspn(expand->s + pos, expand->len - pos, split);
++               if (pos < expand->len)
++                   expand->s[pos] = '.';
++           }
++   }
++
++   if (urlencode) {
++       stralloc_copyb(&sa, expand->s + start, expand->len - start);
++       expand->len = start;
++
++       for(pos = 0; pos < sa.len; ++pos) {
++           ch = sa.s[pos];
++           if (urlchr_table[(unsigned char)ch]) {
++               if (!stralloc_readyplus(expand, 3)) return 0;
++               expand->s[expand->len++] = '%';
++               expand->s[expand->len++] = hexdigits[(unsigned char)ch >> 4];
++               expand->s[expand->len++] = hexdigits[(unsigned char)ch & 15];
++           } else
++               if (!stralloc_append(expand, &ch)) return 0;
++       }
++   }
++
++   alloc_free(sa.s);
++   return 1;
++}
++
++int spfexpand(stralloc *sa, char *spec, char *domain)
++{
++   char *p;
++   char append;
++   int pos;
++
++   if (!stralloc_readyplus(sa, 0)) return 0;
++   sa->len = 0;
++
++   for(p = spec; *p; p++) {
++       append = *p;
++       if (*p == '%') {
++           p++;
++           switch(*p) {
++               case '%': break;
++               case '_': append = ' '; break;
++               case '-': if (!stralloc_cats(sa, "%20")) return 0; continue;
++               case '{':
++                   pos = str_chr(p, '}');
++                   if (p[pos] != '}') { p--; break; }
++                   p[pos] = 0;
++                   if (!spfsubst(sa, p + 1, domain)) return 0;
++                   p += pos;
++                   continue;
++               default: p--;
++           }
++       }
++       if (!stralloc_append(sa, &append)) return 0;
++   }
++
++   return 1;
++}
++
++static int spflookup(stralloc *domain);
++
++static int spf_include(char *spec, char *mask)
++{
++   stralloc sa = {0};
++   int r;
++
++   if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++   r = spflookup(&sa);
++   alloc_free(sa.s);
++
++   switch(r) {
++       case SPF_NONE:
++           hdr_unknown();
++           r = SPF_UNKNOWN;
++           break;
++       case SPF_SYNTAX:
++           r = SPF_UNKNOWN;
++           break;
++       case SPF_NEUTRAL:
++       case SPF_SOFTFAIL:
++       case SPF_FAIL:
++           r = SPF_NONE;
++           break;
++   }
++
++   return r;
++}
++
++static int spf_a(char *spec, char *mask)
++{
++   stralloc sa = {0};
++   ipalloc ia = {0};
++   int ipmask = getipmask(mask, 1);
++   int r;
++   int j;
++
++   if (ipmask < 0) return SPF_SYNTAX;
++
++   if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++   if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++
++   switch(dns_ip(&ia, &sa)) {
++       case DNS_MEM: return SPF_NOMEM;
++       case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++       case DNS_HARD: r = SPF_NONE; break;
++       default:
++           r = SPF_NONE;
++           for(j = 0; j < ia.len; ++j)
++               if (matchip(&ia.ix[j].ip, ipmask, &ip)) {
++                   r = SPF_OK;
++                   break;
++               }
++   }
++
++   alloc_free(sa.s);
++   alloc_free(ia.ix);
++   return r;
++}
++
++static int spf_mx(char *spec, char *mask)
++{
++   stralloc sa = {0};
++   ipalloc ia = {0};
++   int ipmask = getipmask(mask, 1);
++   int random = now() + (getpid() << 16);
++   int r;
++   int j;
++
++   if (ipmask < 0) return SPF_SYNTAX;
++
++   if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++   if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++
++   switch(dns_mxip(&ia, &sa, random)) {
++       case DNS_MEM: return SPF_NOMEM;
++       case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++       case DNS_HARD: r = SPF_NONE; break;
++       default:
++           r = SPF_NONE;
++           for(j = 0; j < ia.len; ++j)
++               if (matchip(&ia.ix[j].ip, ipmask, &ip)) {
++                   r = SPF_OK;
++                   break;
++               }
++   }
++
++   alloc_free(sa.s);
++   alloc_free(ia.ix);
++   return r;
++}
++
++
++static int spf_ip(char *spec, char *mask)
++{
++   struct ip_address net;
++   int ipmask = getipmask(mask, 0);
++
++   if (ipmask < 0) return SPF_SYNTAX;
++   if (!ip_scan(spec, &net)) return SPF_SYNTAX;
++
++   if (matchip(&net, ipmask, &ip)) return SPF_OK;
++
++   return SPF_NONE;
++}
++
++static int spf_exists(char *spec, char *mask)
++{
++   stralloc sa = {0};
++   ipalloc ia = {0};
++   int r;
++
++   if (!stralloc_copys(&sa, spec)) return SPF_NOMEM;
++   if (!stralloc_readyplus(&ia, 0)) return SPF_NOMEM;
++
++   switch(dns_ip(&ia, &sa)) {
++       case DNS_MEM: return SPF_NOMEM;
++       case DNS_SOFT: hdr_dns(); r = SPF_ERROR; break;
++       case DNS_HARD: r = SPF_NONE; break;
++       default: r = SPF_OK;
++   }
++
++   alloc_free(sa.s);
++   alloc_free(ia.ix);
++   return r;
++}
++
++static struct mechanisms {
++  char *mechanism;
++  int (*func)(char *spec, char *mask);
++  unsigned int takes_spec  : 1;
++  unsigned int takes_mask  : 1;
++  unsigned int expands     : 1;
++  unsigned int filldomain  : 1;
++  int defresult            : 4;
++} mechanisms[] = {
++  { "all",      0,          0,0,0,0,SPF_OK   }
++, { "include",  spf_include,1,0,1,0,0        }
++, { "a",        spf_a,      1,1,1,1,0        }
++, { "mx",       spf_mx,     1,1,1,1,0        }
++, { "ptr",      spf_ptr,    1,0,1,1,0        }
++, { "ip4",      spf_ip,     1,1,0,0,0        }
++, { "ip6",      0,          1,1,0,0,SPF_NONE }
++, { "exists",   spf_exists, 1,0,1,0,0        }
++, { "extension",0,          1,1,0,0,SPF_EXT  }
++, { 0,          0,          1,1,0,0,SPF_EXT  }
++};
++
++static int spfmech(char *mechanism, char *spec, char *mask, char *domain)
++{
++   struct mechanisms *mech;
++   stralloc sa = {0};
++   int r;
++   int pos;
++
++   for(mech = mechanisms; mech->mechanism; mech++)
++       if (str_equal(mech->mechanism, mechanism)) break;
++
++   if (mech->takes_spec && !spec && mech->filldomain) spec = domain;
++   if (!mech->takes_spec != !spec) return SPF_SYNTAX;
++   if (!mech->takes_mask && mask) return SPF_SYNTAX;
++   if (!mech->func) return mech->defresult;
++
++   if (!stralloc_readyplus(&sa, 0)) return SPF_NOMEM;
++   if (mech->expands && spec != domain) {
++       if (!spfexpand(&sa, spec, domain)) return SPF_NOMEM;
++       for (pos = 0; (sa.len - pos) > 255;) {
++           pos += byte_chr(sa.s + pos, sa.len - pos, '.');
++           if (pos < sa.len) pos++;
++       }
++       sa.len -= pos;
++       if (pos > 0) byte_copy(sa.s, sa.len, sa.s + pos);
++       stralloc_0(&sa);
++       spec = sa.s;
++   }
++
++   r = mech->func(spec, mask);
++
++   alloc_free(sa.s);
++   return r;
++}
++
++static struct default_aliases {
++  char *alias;
++  int defret;
++} default_aliases[] = {
++  { "allow",   SPF_OK }
++, { "pass",    SPF_OK }
++, { "deny",    SPF_FAIL }
++, { "softdeny",SPF_SOFTFAIL }
++, { "fail",    SPF_FAIL }
++, { "softfail",SPF_SOFTFAIL }
++, { "unknown", SPF_NEUTRAL }
++, { 0,         SPF_UNKNOWN }
++};
++
++static int spflookup(stralloc *domain)
++{
++   stralloc spf = {0};
++   stralloc sa = {0};
++   struct default_aliases *da;
++   int main = !recursion;
++   int local_pos = -1;
++   int r, q;
++   int begin, pos;
++   int i;
++   int prefix;
++   int done;
++   int guessing = 0;
++   char *p;
++
++   if (!stralloc_readyplus(&spf, 0)) return SPF_NOMEM;
++   if (!stralloc_readyplus(&sa, 0)) return SPF_NOMEM;
++
++   /* fallthrough result */
++   if (main) hdr_none();
++
++redirect:
++   if (++recursion > 20) {
++       alloc_free(spf.s);
++       alloc_free(sa.s);
++       hdr_unknown_msg("Maximum nesting level exceeded, possible loop");
++       return SPF_SYNTAX;
++   }
++
++   if (!stralloc_0(domain)) return SPF_NOMEM;
++   if (!stralloc_copy(&expdomain, domain)) return SPF_NOMEM;
++
++   r = spfget(&spf, domain);
++   if (r == SPF_NONE) {
++       if (!main) { alloc_free(spf.s); return r; }
++
++       if (spfguess.len) {
++           /* try to guess */
++           guessing = 1;
++           if (!stralloc_copys(&spf, spfguess.s)) return SPF_NOMEM;
++           if (!stralloc_append(&spf, " ")) return SPF_NOMEM;
++       } else
++           spf.len = 0;
++
++       /* append local rulest */
++       if (spflocal.len) {
++           local_pos = spf.len;
++           if (!stralloc_cats(&spf, spflocal.s)) return SPF_NOMEM;
++       }
++       if (!stralloc_0(&spf)) return SPF_NOMEM;
++
++       expdomain.len = 0;
++   } else if (r == SPF_OK) {
++       if (!stralloc_0(&spf)) return SPF_NOMEM;
++       if (main) hdr_neutral();
++       r = SPF_NEUTRAL;
++
++       /* try to add local rules before fail all mechs */
++       if (main && spflocal.len) {
++           pos = 0;
++           p = (char *) 0;
++           while(pos < spf.len) {
++               NXTOK(begin, pos, &spf);
++               if (!spf.s[begin]) continue;
++
++               if (p && spf.s[begin] != *p) p = (char *) 0;
++               if (!p && (spf.s[begin] == '-' || spf.s[begin] == '~' ||
++                          spf.s[begin] == '?')) p = &spf.s[begin];
++
++               if (p && p > spf.s && str_equal(spf.s + begin + 1, "all")) {
++                   /* ok, we can insert the local rules at p */
++                   local_pos = p - spf.s;
++
++                   stralloc_readyplus(&spf, spflocal.len);
++                   p = spf.s + local_pos;
++                   byte_copyr(p + spflocal.len, spf.len - local_pos, p);
++                   byte_copy(p, spflocal.len, spflocal.s);
++                   spf.len += spflocal.len;
++
++                   pos += spflocal.len;
++                   break;
++               }
++           }
++
++           if (pos >= spf.len) pos = spf.len - 1;
++           for(i = 0; i < pos; i++)
++               if (!spf.s[i]) spf.s[i] = ' ';
++       }
++   } else {
++       alloc_free(spf.s);
++       return r;
++   }
++
++   pos = 0;
++   done = 0;
++   while(pos < spf.len) {
++       NXTOK(begin, pos, &spf);
++       if (!spf.s[begin]) continue;
++
++       /* in local ruleset? */
++       if (!done && local_pos >= 0 && begin >= local_pos) {
++           if (begin < (local_pos + spflocal.len))
++               expdomain.len = 0;
++           else
++               if (!stralloc_copy(&expdomain, domain))
++                   return SPF_NOMEM;
++       }
++
++       for (p = spf.s + begin;*p;++p)
++           if (*p == ':' || *p == '/' || *p == '=') break;
++
++       if (*p == '=') {
++           *p++ = 0;
++
++           /* modifiers are simply handled here */
++           if (str_equal(spf.s + begin, "redirect")) {
++               if (done) continue;
++
++               if (!spfexpand(&sa, p, domain->s)) return SPF_NOMEM;
++               stralloc_copy(domain, &sa);
++
++               hdr_unknown();
++               r = SPF_UNKNOWN;
++
++               goto redirect;
++           } else if (str_equal(spf.s + begin, "default")) {
++               if (done) continue;
++
++               for(da = default_aliases; da->alias; ++da)
++                   if (str_equal(da->alias, p)) break;
++
++               r = da->defret;
++           } else if (str_equal(spf.s + begin, "exp")) {
++               strsalloc ssa = {0};
++
++               if (!main) continue;
++
++               if (!stralloc_copys(&sa, p)) return SPF_NOMEM;
++               switch(dns_txt(&ssa, &sa)) {
++                   case DNS_MEM: return SPF_NOMEM;
++                   case DNS_SOFT: continue; /* FIXME... */
++                   case DNS_HARD: continue;
++               }
++
++               explanation.len = 0;
++               for(i = 0; i < ssa.len; i++) {
++                   if (!stralloc_cat(&explanation, &ssa.sa[i])) return SPF_NOMEM;
++                   if (i < (ssa.len - 1))
++                       if (!stralloc_append(&explanation, "\n")) return SPF_NOMEM;
++
++                   alloc_free(ssa.sa[i].s);
++               }
++               if (!stralloc_0(&explanation)) return SPF_NOMEM;
++           } /* and unknown modifiers are ignored */
++       } else if (!done) {
++           if (!stralloc_copys(&sa, spf.s + begin)) return SPF_NOMEM;
++           if (!stralloc_0(&sa)) return SPF_NOMEM;
++
++           switch(spf.s[begin]) {
++               case '-': begin++; prefix = SPF_FAIL; break;
++               case '~': begin++; prefix = SPF_SOFTFAIL; break;
++               case '+': begin++; prefix = SPF_OK; break;
++               case '?': begin++; prefix = SPF_NEUTRAL; break;
++               default: prefix = SPF_OK;
++           }
++
++           if (*p == '/') {
++               *p++ = 0;
++               q = spfmech(spf.s + begin, 0, p, domain->s);
++           } else {
++               if (*p) *p++ = 0;
++               i = str_chr(p, '/');
++               if (p[i] == '/') {
++                   p[i++] = 0;
++                   q = spfmech(spf.s + begin, p, p + i, domain->s);
++               } else if (i > 0)
++                   q = spfmech(spf.s + begin, p, 0, domain->s);
++               else
++                   q = spfmech(spf.s + begin, 0, 0, domain->s);
++           }
++
++           if (q == SPF_OK) q = prefix;
++
++           switch(q) {
++               case SPF_OK: hdr_pass(); break;
++               case SPF_NEUTRAL: hdr_neutral(); break;
++               case SPF_SYNTAX: hdr_syntax(); break;
++               case SPF_SOFTFAIL: hdr_softfail(); break;
++               case SPF_FAIL: hdr_fail(); break;
++               case SPF_EXT: hdr_ext(sa.s); break;
++               case SPF_ERROR:
++                   if (!guessing)
++                       break;
++                   if (local_pos >= 0 && begin >= local_pos)
++                       break;
++                   hdr_none();
++                   q = SPF_NONE;
++                   break;
++               case SPF_NONE: continue;
++           }
++
++           r = q;
++           done = 1; /* we're done, no more mechanisms */
++       }
++   }
++
++   /* we fell through, no local rule applied */
++   if (!done && !stralloc_copy(&expdomain, domain)) return SPF_NOMEM;
++
++   alloc_free(spf.s);
++   alloc_free(sa.s);
++   return r;
++}
++
++int spfcheck()
++{
++   stralloc domain = {0};
++   int pos;
++   int r;
++
++   pos = byte_rchr(addr.s, addr.len, '@') + 1;
++   if (pos < addr.len) {
++       if (!stralloc_copys(&domain, addr.s + pos)) return SPF_NOMEM;
++   } else {
++       pos = str_rchr(helohost.s, '@');
++       if (helohost.s[pos]) {
++           if (!stralloc_copys(&domain, helohost.s + pos + 1)) return SPF_NOMEM;
++       } else
++           if (!stralloc_copys(&domain, helohost.s)) return SPF_NOMEM;
++   }
++   if (!stralloc_copys(&explanation, spfexp.s)) return SPF_NOMEM;
++   if (!stralloc_0(&explanation)) return SPF_NOMEM;
++   recursion = 0;
++
++   if (!remoteip || !ip_scan(remoteip, &ip)) {
++       hdr_unknown_msg("No IP address in conversation");
++       return SPF_UNKNOWN;
++   }
++
++   if (!stralloc_readyplus(&expdomain, 0)) return SPF_NOMEM;
++   if (!stralloc_readyplus(&errormsg, 0)) return SPF_NOMEM;
++   expdomain.len = 0;
++   errormsg.len = 0;
++   sender_fqdn.len = 0;
++   received = (char *) 0;
++
++   if ((ip.d[0] == 127 && ip.d[1] == 0 && ip.d[2] == 0 && ip.d[3] == 1) || ipme_is(&ip))
++       { hdr_pass(); r = SPF_OK; }
++   else
++       r = spflookup(&domain);
++
++   if (r < 0) r = SPF_UNKNOWN;
++
++   alloc_free(domain.s);
++   return r;
++}
++
++int spfexplanation(sa)
++stralloc *sa;
++{
++   return spfexpand(sa, explanation.s, expdomain.s);
++}
++
++int spfinfo(sa)
++stralloc *sa;
++{
++   stralloc tmp = {0};
++   if (!stralloc_copys(&tmp, received)) return 0;
++   if (!stralloc_0(&tmp)) return 0;
++   if (!spfexpand(sa, tmp.s, expdomain.s)) return 0;
++   alloc_free(tmp.s);
++   return 1;
++}
+diff -rupN qmail-1.03/spf.h qmail-1.03-IPv6spfptr/spf.h
+--- qmail-1.03/spf.h    1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/spf.h 2014-10-15 11:59:36.890618519 +0300
+@@ -0,0 +1,20 @@
++#ifndef SPF_H
++#define SPF_H
++
++#define SPF_OK       0
++#define SPF_NONE     1
++#define SPF_UNKNOWN  2
++#define SPF_NEUTRAL  3
++#define SPF_SOFTFAIL 4
++#define SPF_FAIL     5
++#define SPF_ERROR    6
++#define SPF_NOMEM    7
++
++#define SPF_DEFEXP   "See http://spf.pobox.com/" \
++                     "why.html?sender=%{S}&ip=%{I}&receiver=%{xR}"
++
++extern int spfcheck();
++extern int spfexplanation();
++extern int spfinfo();
++
++#endif
+diff -rupN qmail-1.03/spfquery.c qmail-1.03-IPv6spfptr/spfquery.c
+--- qmail-1.03/spfquery.c   1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/spfquery.c    2014-10-15 11:59:36.890618519 +0300
+@@ -0,0 +1,84 @@
++#include "substdio.h"
++#include "subfd.h"
++#include "stralloc.h"
++#include "alloc.h"
++#include "spf.h"
++#include "exit.h"
++
++void die(e,s) int e; char *s; { substdio_putsflush(subfderr,s); _exit(e); }
++void die_usage() { die(100,"fatal: invalid usage\nusage: spfquery <sender-ip> <sender-helo/ehlo> <envelope-from> [<local rules>] [<best guess rules>]\n"); }
++void die_nomem() { die(111,"fatal: out of memory\n"); }
++
++stralloc addr = {0};
++stralloc helohost = {0};
++char *remoteip;
++char *local;
++
++stralloc spflocal = {0};
++stralloc spfguess = {0};
++stralloc spfexp = {0};
++
++void main(argc,argv)
++int argc;
++char **argv;
++{
++   stralloc sa = {0};
++   int r;
++
++   if (argc < 4) die_usage();
++
++   remoteip = (char *)strdup(argv[1]);
++   local = "localhost";
++
++   if (!stralloc_copys(&helohost, argv[2])) die_nomem();
++   if (!stralloc_0(&helohost)) die_nomem();
++
++   if (!stralloc_copys(&addr, argv[3])) die_nomem();
++   if (!stralloc_0(&addr)) die_nomem();
++
++   if (argc > 4) {
++       if (!stralloc_copys(&spflocal, argv[4])) die_nomem();
++       if (spflocal.len && !stralloc_0(&spflocal)) die_nomem();
++   }
++
++   if (argc > 5) {
++       if (!stralloc_copys(&spfguess, argv[5])) die_nomem();
++       if (spfguess.len && !stralloc_0(&spfguess)) die_nomem();
++   }
++
++   if (argc > 6) {
++       if (!stralloc_copys(&spfexp, argv[6])) die_nomem();
++   } else
++       if (!stralloc_copys(&spfexp, SPF_DEFEXP)) die_nomem();
++   if (spfexp.len && !stralloc_0(&spfexp)) die_nomem();
++
++   dns_init(0);
++   r = spfcheck();
++   if (r == SPF_NOMEM) die_nomem();
++
++   substdio_puts(subfdout,"result=");
++   switch(r) {
++       case SPF_OK: substdio_puts(subfdout,"pass"); break;
++       case SPF_NONE: substdio_puts(subfdout,"none"); break;
++       case SPF_UNKNOWN: substdio_puts(subfdout,"unknown"); break;
++       case SPF_NEUTRAL: substdio_puts(subfdout,"neutral"); break;
++       case SPF_SOFTFAIL: substdio_puts(subfdout,"softfail"); break;
++       case SPF_FAIL: substdio_puts(subfdout,"fail"); break;
++       case SPF_ERROR: substdio_puts(subfdout,"error"); break;
++   }
++
++   if (r == SPF_FAIL) {
++       substdio_puts(subfdout,": ");
++       if (!spfexplanation(&sa)) die_nomem();
++       substdio_put(subfdout,sa.s,sa.len);
++   }
++
++   substdio_putsflush(subfdout,"\n");
++
++   substdio_puts(subfdout,"Received-SPF: ");
++   if (!spfinfo(&sa)) die_nomem();
++   substdio_put(subfdout,sa.s,sa.len);
++   substdio_putsflush(subfdout,"\n");
++
++   _exit(0);
++}
+diff -rupN qmail-1.03/str_cpyb.c qmail-1.03-IPv6spfptr/str_cpyb.c
+--- qmail-1.03/str_cpyb.c   1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/str_cpyb.c    2014-10-15 11:59:36.890618519 +0300
+@@ -0,0 +1,18 @@
++#include "str.h"
++
++unsigned int str_copyb(s,t,max)
++register char *s;
++register char *t;
++unsigned int max;
++{
++  register int len;
++
++  len = 0;
++  while (max-- > 0) {
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++  }
++  return len;
++}
+diff -rupN qmail-1.03/str.h qmail-1.03-IPv6spfptr/str.h
+--- qmail-1.03/str.h    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/str.h 2014-10-15 11:59:36.890618519 +0300
+@@ -2,6 +2,7 @@
+ #define STR_H
+  
+ extern unsigned int str_copy();
++extern unsigned int str_copyb();
+ extern int str_diff();
+ extern int str_diffn();
+ extern unsigned int str_len();
+diff -rupN qmail-1.03/strsalloc.c qmail-1.03-IPv6spfptr/strsalloc.c
+--- qmail-1.03/strsalloc.c  1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/strsalloc.c   2014-10-15 11:59:36.890618519 +0300
+@@ -0,0 +1,7 @@
++#include "alloc.h"
++#include "gen_allocdefs.h"
++#include "stralloc.h"
++#include "strsalloc.h"
++
++GEN_ALLOC_readyplus(strsalloc,stralloc,sa,len,a,i,n,x,10,strsalloc_readyplus)
++GEN_ALLOC_append(strsalloc,stralloc,sa,len,a,i,n,x,10,strsalloc_readyplus,strsalloc_append)
+diff -rupN qmail-1.03/strsalloc.h qmail-1.03-IPv6spfptr/strsalloc.h
+--- qmail-1.03/strsalloc.h  1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/strsalloc.h   2014-10-15 11:59:36.890618519 +0300
+@@ -0,0 +1,12 @@
++#ifndef STRSALLOC_H
++#define STRSALLOC_H
++
++#include "stralloc.h"
++
++#include "gen_alloc.h"
++
++GEN_ALLOC_typedef(strsalloc,stralloc,sa,len,a)
++extern int strsalloc_readyplus();
++extern int strsalloc_append();
++
++#endif
+diff -rupN qmail-1.03/TARGETS qmail-1.03-IPv6spfptr/TARGETS
+--- qmail-1.03/TARGETS  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/TARGETS   2014-10-15 11:59:36.890618519 +0300
+@@ -100,11 +100,14 @@ str_len.o
+ str_diff.o
+ str_diffn.o
+ str_cpy.o
++str_cpyb.o
+ str_chr.o
+ str_rchr.o
+ str_start.o
+ byte_chr.o
+ byte_rchr.o
++byte_cspn.o
++byte_rcspn.o
+ byte_diff.o
+ byte_copy.o
+ byte_cr.o
+@@ -171,8 +174,10 @@ timeoutwrite.o
+ timeoutconn.o
+ tcpto.o
+ dns.o
++spf.o
+ ip.o
+ ipalloc.o
++strsalloc.o
+ hassalen.h
+ ipme.o
+ ndelay.o
+@@ -212,6 +217,9 @@ qmail-inject.o
+ headerbody.o
+ hfield.o
+ token822.o
++spf.o
++spfquery.o
++spfquery
+ qmail-inject
+ predate.o
+ predate
+@@ -270,6 +278,8 @@ dnsip.o
+ dnsip
+ dnsmxip.o
+ dnsmxip
++dnstxt.o
++dnstxt
+ dnsfq.o
+ dnsfq
+ hostname.o
+diff -rupN qmail-1.03/tcp-env.c qmail-1.03-IPv6spfptr/tcp-env.c
+--- qmail-1.03/tcp-env.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/tcp-env.c 2014-10-15 12:05:48.794609655 +0300
+@@ -2,6 +2,7 @@
+ #include <sys/socket.h>
+ #include <sys/param.h>
+ #include <netinet/in.h>
++#include <netdb.h>
+ #include "sig.h"
+ #include "stralloc.h"
+ #include "str.h"
+@@ -10,35 +11,72 @@
+ #include "scan.h"
+ #include "subgetopt.h"
+ #include "ip.h"
++#include "strsalloc.h"
+ #include "dns.h"
+ #include "byte.h"
+ #include "remoteinfo.h"
+ #include "exit.h"
+ #include "case.h"
++#include "hassalen.h"
++
+  
+ void die() { _exit(111); }
+  
+-struct sockaddr_in salocal;
++union sockunion {
++       struct sockaddr     sa;
++       struct sockaddr_in  sa4;
++#ifdef INET6
++       struct sockaddr_in6 sa6;
++#endif
++};
++
++char temp[HOSTNAMELEN];
++
++union sockunion salocal;
+ unsigned long localport;
+ struct ip_address iplocal;
+ stralloc localname = {0};
+  
+-struct sockaddr_in saremote;
++union sockunion saremote;
+ unsigned long remoteport;
+-struct ip_address ipremote;
+ stralloc remotename = {0};
+  
+-char temp[IPFMT + FMT_ULONG];
++#if defined(IN6_IS_ADDR_V4MAPPED) && defined(INET6)
++void mappedtov4(union sockunion *sa)
++{
++       struct sockaddr_in sin;
++       struct sockaddr_in6 *sin6 = &sa->sa6;
++
++       bzero(&sin, sizeof(sin));
++       if (sin6->sin6_family == AF_INET6 &&
++         IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr) ) {
++               memcpy(&sin.sin_addr, sin6->sin6_addr.s6_addr+12, sizeof(sin.sin_addr));
++               sin.sin_port = sin6->sin6_port;
++               sin.sin_family = AF_INET;
++#ifdef HASSALEN
++               sin.sin_len = sizeof(sin);
++#endif
++               memcpy(&sa->sa4, &sin, sizeof(sin));
++       }
++               
++}
++#else
++#define mappedtov4(A)
++#endif
++
+  
+ void main(argc,argv)
+ int argc;
+ char *argv[];
+ {
++ strsalloc ssa = {0};
+  int dummy;
+  char *proto;
+  int opt;
+  int flagremoteinfo;
+  unsigned long timeout;
++ struct sockaddr_in *v4;
++
+  
+  sig_pipeignore();
+  
+@@ -65,21 +103,25 @@ char *argv[];
+  
+    dummy = sizeof(salocal);
+    if (getsockname(0,(struct sockaddr *) &salocal,&dummy) == -1) die();
++   mappedtov4(&salocal);
++
++   switch(salocal.sa.sa_family) {
++   case AF_INET:
++       localport = ntohs(salocal.sa4.sin_port);
+  
+-   localport = ntohs(salocal.sin_port);
+    temp[fmt_ulong(temp,localport)] = 0;
+    if (!env_put2("TCPLOCALPORT",temp)) die();
+  
+-   byte_copy(&iplocal,4,&salocal.sin_addr);
+-   temp[ip_fmt(temp,&iplocal)] = 0;
++       temp[ip_fmt(temp, &salocal.sa4.sin_addr)] = 0;
++
+    if (!env_put2("TCPLOCALIP",temp)) die();
+  
+-   switch(dns_ptr(&localname,&iplocal))
+-    {
++     switch(dns_ptr(&localname,&salocal.sa4.sin_addr)) {
+      case DNS_MEM: die();
+      case DNS_SOFT:
+        if (!stralloc_copys(&localname,"softdnserror")) die();
+      case 0:
++       if (!stralloc_copy(&localname,&ssa.sa[0])) die();
+        if (!stralloc_0(&localname)) die();
+        case_lowers(localname.s);
+        if (!env_put2("TCPLOCALHOST",localname.s)) die();
+@@ -88,23 +130,74 @@ char *argv[];
+        if (!env_unset("TCPLOCALHOST")) die();
+     }
+  
++       break;
++#ifdef INET6
++   case AF_INET6:
++       localport = ntohs(salocal.sa6.sin6_port);
++        temp[fmt_ulong(temp,localport)] = 0;
++        if (!env_put2("TCPLOCALPORT",temp)) die();
++       temp[ip6_fmt(temp, &salocal.sa6.sin6_addr)] = 0;
++       if (!env_put2("TCPLOCALIP",temp)) die();
++       switch(dns_ptr6(&localname,&salocal.sa6.sin6_addr)) {
++       case DNS_MEM: die();
++       case DNS_SOFT:
++         if (!stralloc_copys(&localname,"softdnserror")) die();
++       case 0:
++         if (!stralloc_0(&localname)) die();
++         case_lowers(localname.s);
++         if (!env_put2("TCPLOCALHOST",localname.s)) die();
++         break;
++       default:
++         if (!env_unset("TCPLOCALHOST")) die();
++       }
++       break;
++#endif
++   default:
++       die();
++   }
++
++
+    dummy = sizeof(saremote);
+    if (getpeername(0,(struct sockaddr *) &saremote,&dummy) == -1) die();
++   mappedtov4(&saremote);
++
++
++   switch(saremote.sa.sa_family) {
++   case AF_INET:
++       remoteport = ntohs(saremote.sa4.sin_port);
+  
+-   remoteport = ntohs(saremote.sin_port);
+    temp[fmt_ulong(temp,remoteport)] = 0;
+    if (!env_put2("TCPREMOTEPORT",temp)) die();
++       temp[ip_fmt(temp, &saremote.sa4.sin_addr)] = 0;
+  
+-   byte_copy(&ipremote,4,&saremote.sin_addr);
+-   temp[ip_fmt(temp,&ipremote)] = 0;
+    if (!env_put2("TCPREMOTEIP",temp)) die();
++       switch(dns_ptr(&remotename,&saremote.sa4.sin_addr)) {
++       case DNS_MEM: die();
++       case DNS_SOFT:
++         if (!stralloc_copys(&remotename,"softdnserror")) die();
++       case 0:
++         if (!stralloc_0(&remotename)) die();
++         case_lowers(remotename.s);
++         if (!env_put2("TCPREMOTEHOST",remotename.s)) die();
++         break;
++       default:
++         if (!env_unset("TCPREMOTEHOST")) die();
++       }
++       break;
++#ifdef INET6
++   case AF_INET6:
++       remoteport = ntohs(saremote.sa6.sin6_port);
++        temp[fmt_ulong(temp,remoteport)] = 0;
++       if (!env_put2("TCPREMOTEPORT",temp)) die();
++       temp[ip6_fmt(temp, &saremote.sa6.sin6_addr)] = 0;
++       if (!env_put2("TCPREMOTEIP",temp)) die();
++       switch(dns_ptr6(&remotename,&saremote.sa6.sin6_addr)) {
+  
+-   switch(dns_ptr(&remotename,&ipremote))
+-    {
+      case DNS_MEM: die();
+      case DNS_SOFT:
+        if (!stralloc_copys(&remotename,"softdnserror")) die();
+      case 0:
++       if (!stralloc_copy(&remotename,&ssa.sa[0])) die();
+        if (!stralloc_0(&remotename)) die();
+        case_lowers(remotename.s);
+        if (!env_put2("TCPREMOTEHOST",remotename.s)) die();
+@@ -112,12 +205,19 @@ char *argv[];
+      default:
+        if (!env_unset("TCPREMOTEHOST")) die();
+     }
++       break;
++#endif
++   default:
++       die();
++   }
++
+  
+    if (!env_unset("TCPREMOTEINFO")) die();
++
+    if (flagremoteinfo)
+     {
+      char *rinfo;
+-     rinfo = remoteinfo_get(&ipremote,remoteport,&iplocal,localport,(int) timeout);
++     rinfo = remoteinfo_get(&saremote, &salocal,(int) timeout);
+      if (rinfo)
+        if (!env_put2("TCPREMOTEINFO",rinfo)) die();
+     }
+@@ -127,3 +227,4 @@ char *argv[];
+  execvp(*argv,argv);
+  die();
+ }
++
+diff -rupN qmail-1.03/tcp-env.c~ qmail-1.03-IPv6spfptr/tcp-env.c~
+--- qmail-1.03/tcp-env.c~   1970-01-01 02:00:00.000000000 +0200
++++ qmail-1.03-IPv6spfptr/tcp-env.c~    2014-10-15 11:59:44.626618334 +0300
+@@ -0,0 +1,171 @@
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/param.h>
++#include <netinet/in.h>
++#include <netdb.h>
++#include "sig.h"
++#include "stralloc.h"
++#include "str.h"
++#include "env.h"
++#include "fmt.h"
++#include "scan.h"
++#include "subgetopt.h"
++#include "ip.h"
++#include "strsalloc.h"
++#include "dns.h"
++#include "byte.h"
++#include "remoteinfo.h"
++#include "exit.h"
++#include "case.h"
++#include "hassalen.h"
++
++void die() { _exit(111); }
++
++union sockunion {
++   struct sockaddr     sa;
++   struct sockaddr_in  sa4;
++#ifdef INET6
++   struct sockaddr_in6 sa6;
++#endif
++};
++
++char temp[HOSTNAMELEN];
++
++union sockunion salocal;
++unsigned long localport;
++stralloc localname = {0};
++
++union sockunion saremote;
++unsigned long remoteport;
++stralloc remotename = {0};
++
++#if defined(IN6_IS_ADDR_V4MAPPED) && defined(INET6)
++void mappedtov4(union sockunion *sa)
++{
++   struct sockaddr_in sin;
++   struct sockaddr_in6 *sin6 = &sa->sa6;
++
++   bzero(&sin, sizeof(sin));
++   if (sin6->sin6_family == AF_INET6 &&
++     IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr) ) {
++       memcpy(&sin.sin_addr, sin6->sin6_addr.s6_addr+12, sizeof(sin.sin_addr));
++       sin.sin_port = sin6->sin6_port;
++       sin.sin_family = AF_INET;
++#ifdef HASSALEN
++       sin.sin_len = sizeof(sin);
++#endif
++       memcpy(&sa->sa4, &sin, sizeof(sin));
++   }
++       
++}
++#else
++#define mappedtov4(A)
++#endif
++
++void main(argc,argv)
++int argc;
++char *argv[];
++{
++ strsalloc ssa = {0};
++ int dummy;
++ char *proto;
++ int opt;
++ int flagremoteinfo;
++ unsigned long timeout;
++ struct sockaddr_in *v4;
++
++ sig_pipeignore();
++
++ flagremoteinfo = 1;
++ timeout = 30;
++ while ((opt = sgopt(argc,argv,"rRt:")) != sgoptdone)
++   switch(opt)
++    {
++     case 'r': flagremoteinfo = 1; break;
++     case 'R': flagremoteinfo = 0; break;
++     case 't': scan_ulong(sgoptarg,&timeout); break;
++    }
++
++ argv += sgoptind;
++ argc -= sgoptind;
++
++ if (argc < 1) die();
++ if (!env_init()) die();
++
++ proto = env_get("PROTO");
++ if (!proto || str_diff(proto,"TCP"))
++  {
++   if (!env_put("PROTO=TCP")) die();
++
++   dummy = sizeof(salocal);
++   if (getsockname(0,(struct sockaddr *) &salocal,&dummy) == -1) die();
++
++   localport = ntohs(salocal.sin_port);
++   temp[fmt_ulong(temp,localport)] = 0;
++   if (!env_put2("TCPLOCALPORT",temp)) die();
++
++   byte_copy(&iplocal,4,&salocal.sin_addr);
++   temp[ip_fmt(temp,&iplocal)] = 0;
++   if (!env_put2("TCPLOCALIP",temp)) die();
++
++   switch(dns_ptr(&ssa,&iplocal))
++    {
++     case DNS_MEM: die();
++     case DNS_SOFT:
++       if (!stralloc_copys(&localname,"softdnserror")) die();
++     case 0:
++       if (!stralloc_copy(&localname,&ssa.sa[0])) die();
++       if (!stralloc_0(&localname)) die();
++       case_lowers(localname.s);
++       if (!env_put2("TCPLOCALHOST",localname.s)) die();
++       break;
++     default:
++       if (!env_unset("TCPLOCALHOST")) die();
++    }
++
++   dummy = sizeof(saremote);
++   if (getpeername(0,(struct sockaddr *) &saremote,&dummy) == -1) die();
++
++   remoteport = ntohs(saremote.sin_port);
++   temp[fmt_ulong(temp,remoteport)] = 0;
++   if (!env_put2("TCPREMOTEPORT",temp)) die();
++
++   byte_copy(&ipremote,4,&saremote.sin_addr);
++   temp[ip_fmt(temp,&ipremote)] = 0;
++   if (!env_put2("TCPREMOTEIP",temp)) die();
++
++   switch(dns_ptr(&ssa,&ipremote))
++    {
++     case DNS_MEM: die();
++     case DNS_SOFT:
++       if (!stralloc_copys(&remotename,"softdnserror")) die();
++     case 0:
++       if (!stralloc_copy(&remotename,&ssa.sa[0])) die();
++       if (!stralloc_0(&remotename)) die();
++       case_lowers(remotename.s);
++       if (!env_put2("TCPREMOTEHOST",remotename.s)) die();
++       break;
++     default:
++       if (!env_unset("TCPREMOTEHOST")) die();
++    }
++   break;
++#endif
++   default:
++   die();
++   }
++
++   if (!env_unset("TCPREMOTEINFO")) die();
++
++   if (flagremoteinfo)
++    {
++     char *rinfo;
++     rinfo = remoteinfo_get(&saremote, &salocal,(int) timeout);
++     if (rinfo)
++       if (!env_put2("TCPREMOTEINFO",rinfo)) die();
++    }
++  }
++
++ sig_pipedefault();
++ execvp(*argv,argv);
++ die();
++}
+diff -rupN qmail-1.03/tcpto.c qmail-1.03-IPv6spfptr/tcpto.c
+--- qmail-1.03/tcpto.c  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/tcpto.c   2014-10-15 11:59:44.626618334 +0300
+@@ -1,14 +1,20 @@
++#include <sys/types.h>
++#include <sys/uio.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#include "ipalloc.h"
+ #include "tcpto.h"
+ #include "open.h"
+ #include "lock.h"
+ #include "seek.h"
+ #include "now.h"
+ #include "ip.h"
++#include "ipalloc.h"
+ #include "byte.h"
+ #include "datetime.h"
+ #include "readwrite.h"
+  
+-char tcpto_buf[1024];
++struct tcpto_buf tcpto_buf[TCPTO_BUFSIZ];
+  
+ static int flagwasthere;
+ static int fdlock;
+@@ -23,19 +29,19 @@ static int getbuf()
+  fd = open_read("queue/lock/tcpto");
+  if (fd == -1) { close(fdlock); return 0; }
+  if (lock_ex(fdlock) == -1) { close(fdlock); close(fd); return 0; }
+- r = read(fd,tcpto_buf,sizeof(tcpto_buf));
++ r = read(fd,&tcpto_buf,sizeof(tcpto_buf));
+  close(fd);
+  if (r < 0) { close(fdlock); return 0; }
+- r >>= 4;
++ r /= sizeof(tcpto_buf[0]);
+  if (!r) close(fdlock);
+  return r;
+ }
+  
+-int tcpto(ip) struct ip_address *ip;
++int tcpto(ix)
++struct ip_mx *ix;
+ {
+  int n;
+  int i;
+- char *record;
+  datetime_sec when;
+  
+  flagwasthere = 0;
+@@ -44,37 +50,35 @@ int tcpto(ip) struct ip_address *ip;
+  if (!n) return 0;
+  close(fdlock);
+  
+- record = tcpto_buf;
+  for (i = 0;i < n;++i)
+   {
+-   if (byte_equal(ip->d,4,record))
++#ifdef INET6
++   if (ix->af == tcpto_buf[i].af && (ix->af == AF_INET ? byte_equal(&ix->addr.ip, sizeof(ix->addr.ip), &tcpto_buf[i].addr.ip) : byte_equal(&ix->addr.ip6, sizeof(ix->addr.ip6), &tcpto_buf[i].addr.ip6)))
++#else
++   if (byte_equal(&ix->addr.ip, sizeof(ix->addr.ip), &tcpto_buf[i].addr.ip))
++#endif
+     {
+      flagwasthere = 1;
+-     if (record[4] >= 2)
++     if (tcpto_buf[i].flag >= 2)
+       {
+-       when = (unsigned long) (unsigned char) record[11];
+-       when = (when << 8) + (unsigned long) (unsigned char) record[10];
+-       when = (when << 8) + (unsigned long) (unsigned char) record[9];
+-       when = (when << 8) + (unsigned long) (unsigned char) record[8];
+-
++       when = tcpto_buf[i].when;
+        if (now() - when < ((60 + (getpid() & 31)) << 6))
+     return 1;
+       }
+      return 0;
+     }
+-   record += 16;
+   }
+  return 0;
+ }
+  
+-void tcpto_err(ip,flagerr) struct ip_address *ip; int flagerr;
++void tcpto_err(ix,flagerr)
++struct ip_mx *ix; int flagerr;
+ {
+  int n;
+  int i;
+- char *record;
+  datetime_sec when;
+- datetime_sec firstwhen;
+- int firstpos;
++ datetime_sec firstwhen=0;
++ int firstpos=-1;
+  datetime_sec lastwhen;
+  
+  if (!flagerr)
+@@ -84,80 +88,68 @@ void tcpto_err(ip,flagerr) struct ip_add
+  n = getbuf();
+  if (!n) return;
+  
+- record = tcpto_buf;
+  for (i = 0;i < n;++i)
+   {
+-   if (byte_equal(ip->d,4,record))
++#ifdef INET6
++   if (ix->af == tcpto_buf[i].af && (ix->af == AF_INET ? byte_equal(&ix->addr.ip, sizeof(ix->addr.ip), &tcpto_buf[i].addr.ip) : byte_equal(&ix->addr.ip6, sizeof(ix->addr.ip6), &tcpto_buf[i].addr.ip6)))
++#else
++   if (byte_equal(&ix->addr.ip, sizeof(ix->addr.ip), &tcpto_buf[i].addr.ip))
++#endif
+     {
+      if (!flagerr)
+-       record[4] = 0;
++       tcpto_buf[i].flag = 0;
+      else
+       {
+-       lastwhen = (unsigned long) (unsigned char) record[11];
+-       lastwhen = (lastwhen << 8) + (unsigned long) (unsigned char) record[10];
+-       lastwhen = (lastwhen << 8) + (unsigned long) (unsigned char) record[9];
+-       lastwhen = (lastwhen << 8) + (unsigned long) (unsigned char) record[8];
++       lastwhen = tcpto_buf[i].when;
+        when = now();
+  
+-       if (record[4] && (when < 120 + lastwhen)) { close(fdlock); return; }
++       if (tcpto_buf[i].flag && (when < 120 + lastwhen)) { close(fdlock); return; }
+  
+-       if (++record[4] > 10) record[4] = 10;
+-       record[8] = when; when >>= 8;
+-       record[9] = when; when >>= 8;
+-       record[10] = when; when >>= 8;
+-       record[11] = when;
++       if (++tcpto_buf[i].flag > 10) tcpto_buf[i].flag = 10;
++       tcpto_buf[i].when = when;
+       }
+-     if (seek_set(fdlock,i << 4) == 0)
+-       if (write(fdlock,record,16) < 16)
++     if (seek_set(fdlock,sizeof(tcpto_buf[0])*i) == 0)
++       if (write(fdlock,&tcpto_buf[i],sizeof(tcpto_buf[0])) < sizeof(tcpto_buf[0]))
+          ; /*XXX*/
+      close(fdlock);
+      return;
+     }
+-   record += 16;
+   }
+  
+  if (!flagerr) { close(fdlock); return; }
+  
+- record = tcpto_buf;
+  for (i = 0;i < n;++i)
+-  {
+-   if (!record[4]) break;
+-   record += 16;
+-  }
++   if (tcpto_buf[i].flag == 0) break;
+  
+  if (i >= n)
+   {
+    firstpos = -1;
+-   record = tcpto_buf;
+    for (i = 0;i < n;++i)
+     {
+-     when = (unsigned long) (unsigned char) record[11];
+-     when = (when << 8) + (unsigned long) (unsigned char) record[10];
+-     when = (when << 8) + (unsigned long) (unsigned char) record[9];
+-     when = (when << 8) + (unsigned long) (unsigned char) record[8];
+-     when += (record[4] << 10);
++     when = tcpto_buf[i].when;
++     when += (tcpto_buf[i].flag << 10);
+      if ((firstpos < 0) || (when < firstwhen))
+       {
+        firstpos = i;
+        firstwhen = when;
+       }
+-     record += 16;
+     }
+    i = firstpos;
+   }
+  
+  if (i >= 0)
+   {
+-   record = tcpto_buf + (i << 4);
+-   byte_copy(record,4,ip->d);
+-   when = now();
+-   record[8] = when; when >>= 8;
+-   record[9] = when; when >>= 8;
+-   record[10] = when; when >>= 8;
+-   record[11] = when;
+-   record[4] = 1;
+-   if (seek_set(fdlock,i << 4) == 0)
+-     if (write(fdlock,record,16) < 16)
++   tcpto_buf[i].af = ix->af;
++#ifdef INET6
++   if (ix->af == AF_INET6)
++     byte_copy(&tcpto_buf[i].addr.ip6, 16, &ix->addr.ip6);
++   else
++#endif
++     byte_copy(&tcpto_buf[i].addr.ip, 4, &ix->addr.ip);
++   tcpto_buf[i].when = now();
++   tcpto_buf[i].flag = 1;
++   if (seek_set(fdlock,sizeof(tcpto_buf[0])*i) == 0)
++     if (write(fdlock,&tcpto_buf[i],sizeof(tcpto_buf[0])) < sizeof(tcpto_buf[0]))
+        ; /*XXX*/
+   }
+  
+diff -rupN qmail-1.03/tcpto_clean.c qmail-1.03-IPv6spfptr/tcpto_clean.c
+--- qmail-1.03/tcpto_clean.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/tcpto_clean.c 2014-10-15 11:59:44.630618334 +0300
+@@ -1,9 +1,10 @@
++#include "ipalloc.h"
+ #include "tcpto.h"
+ #include "open.h"
+ #include "substdio.h"
+ #include "readwrite.h"
+  
+-char tcpto_cleanbuf[1024];
++struct tcpto_buf tcpto_cleanbuf[TCPTO_BUFSIZ];
+  
+ void tcpto_clean() /* running from queue/mess */
+ {
+diff -rupN qmail-1.03/tcpto.h qmail-1.03-IPv6spfptr/tcpto.h
+--- qmail-1.03/tcpto.h  1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/tcpto.h   2014-10-15 11:59:44.630618334 +0300
+@@ -1,8 +1,23 @@
+ #ifndef TCPTO_H
+ #define TCPTO_H
+  
+-extern int tcpto();
+-extern void tcpto_err();
+-extern void tcpto_clean();
++#define    TCPTO_BUFSIZ    64
++
++struct tcpto_buf {
++   unsigned char af;
++   unsigned char flag;
++   unsigned long when;
++   union {
++       struct ip_address ip;
++#ifdef INET6
++       struct ip6_address ip6;
++#endif
++       unsigned char dummy[16];
++   } addr;
++};
++
++extern int tcpto(struct ip_mx *ix);
++extern void tcpto_err(struct ip_mx *ix, int flagerr);
++extern void tcpto_clean(void);
+  
+ #endif
+diff -rupN qmail-1.03/timeoutconn.c qmail-1.03-IPv6spfptr/timeoutconn.c
+--- qmail-1.03/timeoutconn.c    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/timeoutconn.c 2014-10-15 11:59:44.630618334 +0300
+@@ -57,3 +57,52 @@ int timeout;
+   errno = error_timeout; /* note that connect attempt is continuing */
+   return -1;
+ }
++
++#ifdef INET6
++int timeoutconn6(s,ip,port,timeout)
++int s;
++struct ip6_address *ip;
++unsigned int port;
++int timeout;
++{
++  char ch;
++  struct sockaddr_in6 sin;
++  char *x;
++  fd_set wfds;
++  struct timeval tv;
++ 
++  byte_zero(&sin,sizeof(sin));
++  byte_copy(&sin.sin6_addr,16,ip);
++  sin.sin6_port = htons(port);;
++  sin.sin6_family = AF_INET6;
++ 
++  if (ndelay_on(s) == -1) return -1;
++ 
++  /* XXX: could bind s */
++ 
++  if (connect(s,(struct sockaddr *) &sin,sizeof(sin)) == 0) {
++    ndelay_off(s);
++    return 0;
++  }
++  if ((errno != error_inprogress) && (errno != error_wouldblock)) return -1;
++ 
++  FD_ZERO(&wfds);
++  FD_SET(s,&wfds);
++  tv.tv_sec = timeout; tv.tv_usec = 0;
++ 
++  if (select(s + 1,(fd_set *) 0,&wfds,(fd_set *) 0,&tv) == -1) return -1;
++  if (FD_ISSET(s,&wfds)) {
++    int dummy;
++    dummy = sizeof(sin);
++    if (getpeername(s,(struct sockaddr *) &sin,&dummy) == -1) {
++      read(s,&ch,1);
++      return -1;
++    }
++    ndelay_off(s);
++    return 0;
++  }
++ 
++  errno = error_timeout; /* note that connect attempt is continuing */
++  return -1;
++}
++#endif
+diff -rupN qmail-1.03/timeoutconn.h qmail-1.03-IPv6spfptr/timeoutconn.h
+--- qmail-1.03/timeoutconn.h    1998-06-15 13:53:16.000000000 +0300
++++ qmail-1.03-IPv6spfptr/timeoutconn.h 2014-10-15 11:59:44.630618334 +0300
+@@ -2,5 +2,6 @@
+ #define TIMEOUTCONN_H
+  
+ extern int timeoutconn();
++extern int timeoutconn6();
+  
+ #endif
